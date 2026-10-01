@@ -55,6 +55,7 @@ let
     import os
     import subprocess
     import sys
+    import time
 
     assert os.getuid() == 4100
     assert not os.path.exists("/run/agent-research/socket")
@@ -80,7 +81,15 @@ let
             "clientInfo": {"name": "container-capability-fixture", "version": "1"}}})
         receive(1)
         send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        args = {"operation": sys.argv[1]}
+        if sys.argv[1] == "hold":
+            print("ready", flush=True)
+            time.sleep(90)
+            sys.exit(0)
+        if sys.argv[1] == "idle-start":
+            # MCP frontend pings do not traverse the internal research RPC.
+            # A healthy stdio client must survive a normal gap between tool calls.
+            time.sleep(65)
+        args = {"operation": "start" if sys.argv[1] == "idle-start" else sys.argv[1]}
         if len(sys.argv) > 2:
             args["job_id"] = sys.argv[2]
         send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
@@ -129,7 +138,7 @@ pkgs.testers.runNixOSTest {
         result = machine.succeed(
             "systemd-run --quiet --wait --pipe --collect "
             "-p User=fixture -p PrivateNetwork=yes -p ProtectHome=yes "
-            "-p ProtectSystem=strict -p RuntimeMaxSec=45 "
+            "-p ProtectSystem=strict -p RuntimeMaxSec=120 "
             "-p TemporaryFileSystem=/run "
             f"-p BindReadOnlyPaths=/run/tentaflake-research/{name}:/run/client "
             f"${pkgs.python3}/bin/python3 ${probe} {operation}{suffix}"
@@ -149,6 +158,25 @@ pkgs.testers.runNixOSTest {
     assert not call("zeroclaw-beta", "status", job_b).get("isError", False)
     assert call("zeroclaw-beta", "status", job_a).get("isError", False)
     assert call("hermes-alpha", "status", job_b).get("isError", False)
+    idle = call("hermes-alpha", "idle-start")
+    assert not idle.get("isError", False), idle
+    # Revocation stops already accepted relays, while the other client remains.
+    machine.succeed(
+        "systemd-run --quiet --collect --unit=relay-stop-fixture "
+        "-p User=fixture -p PrivateNetwork=yes -p ProtectHome=yes "
+        "-p ProtectSystem=strict -p RuntimeMaxSec=120 "
+        "-p TemporaryFileSystem=/run "
+        "-p BindReadOnlyPaths=/run/tentaflake-research/hermes-alpha:/run/client "
+        "-p StandardOutput=file:/run/relay-stop-fixture-output "
+        "${pkgs.python3}/bin/python3 ${probe} hold"
+    )
+    machine.wait_until_succeeds("grep -Fx ready /run/relay-stop-fixture-output")
+    machine.succeed("systemctl list-units --state=running --no-legend 'tentaflake-research-hermes-alpha@*.service' | grep -q service")
+    machine.succeed("systemctl stop tentaflake-research-hermes-alpha.socket")
+    machine.wait_until_fails("systemctl list-units --state=running --no-legend 'tentaflake-research-hermes-alpha@*.service' | grep -q service")
+    machine.succeed("systemctl is-active --quiet tentaflake-research-zeroclaw-beta.socket")
+    assert not call("zeroclaw-beta", "status", job_b).get("isError", False)
+    machine.succeed("systemctl stop relay-stop-fixture.service")
     machine.wait_for_unit("agent-research.service")
   '';
 }

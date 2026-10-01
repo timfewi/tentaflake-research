@@ -48,10 +48,12 @@ Its host socket is `/run/tentaflake-research/NAME/socket`. The root-only parent
 protects each socket capability; only its selected child directory is projected.
 The relay forwards through AF_UNIX with no IP networking. Shared internal
 container UIDs then do not merge job ownership at the research service. Each
-relay permits four connections, exits after 60 seconds idle or one hour total,
-and shares the aggregate research slice limits. Restart the MCP client after
-its relay connection closes. The container-client VM exercises cross-job refusal
-with identical internal client UIDs.
+relay permits four connections and shares the aggregate research slice limits.
+Healthy stdio sessions may remain connected between tool calls; frontend MCP pings
+need not traverse the internal RPC. Stopping a relay socket terminates its accepted
+relay instances. Stopping the upstream socket also stops the client sockets. The
+container-client VM exercises cross-job refusal, a 65-second idle gap and live
+socket revocation.
 
 Practical mode archives evidence with bounded retention; strict mode uses ephemeral
 job content. Budget/accounting data remains persistent. Allocate disk headroom

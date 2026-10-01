@@ -90,6 +90,7 @@ in
       name: _:
       lib.nameValuePair (unitName name) {
         wantedBy = [ "sockets.target" ];
+        partOf = [ "agent-research.socket" ];
         requires = [ "agent-research.socket" ];
         after = [
           "systemd-tmpfiles-setup.service"
@@ -114,12 +115,13 @@ in
         description = "Private research socket relay for ${name}";
         requires = [ "agent-research.socket" ];
         after = [ "agent-research.socket" ];
+        partOf = [ "${unitName name}.socket" ];
         serviceConfig = {
           Type = "exec";
           User = userName name;
           Group = userName name;
           SupplementaryGroups = [ cfg.socketGroup ];
-          ExecStart = "${pkgs.socat}/bin/socat -T60 STDIO UNIX-CONNECT:/run/agent-research/socket";
+          ExecStart = "${pkgs.socat}/bin/socat STDIO UNIX-CONNECT:/run/agent-research/socket";
           StandardInput = "socket";
           StandardOutput = "socket";
           StandardError = "null";
@@ -147,7 +149,6 @@ in
           TasksMax = 16;
           LimitNOFILE = 64;
           LimitCORE = 0;
-          RuntimeMaxSec = 3600;
           TimeoutStopSec = 10;
           KillMode = "control-group";
         };
