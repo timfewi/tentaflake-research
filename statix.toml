@@ -1,0 +1,5 @@
+# NixOS modules and packet fixtures intentionally use dotted option assignments
+# to keep service/network declarations adjacent to their behavioral comments.
+# Regrouping them adds unrelated diff churn; this is a style rule, not a duplicate
+# attribute check (Nix still rejects actual duplicate definitions in an attrset).
+disabled = ["repeated_keys"]

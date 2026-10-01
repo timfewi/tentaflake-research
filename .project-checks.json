@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "source-fast",
+      "argv": [
+        "bash",
+        "scripts/check",
+        "fast"
+      ],
+      "requires": [
+        "bash",
+        "cargo",
+        "rustfmt",
+        "clippy-driver",
+        "nixfmt",
+        "shellcheck",
+        "deadnix",
+        "statix"
+      ],
+      "timeout_seconds": 1800,
+      "profiles": [
+        "fast"
+      ]
+    },
+    {
+      "name": "packages-and-config",
+      "argv": [
+        "nix",
+        "build",
+        "--no-link",
+        ".#research-service",
+        ".#research-client",
+        ".#research-egress",
+        ".#checks.x86_64-linux.module",
+        ".#checks.x86_64-linux.network-boundary",
+        ".#checks.x86_64-linux.resource-boundary"
+      ],
+      "requires": [
+        "nix"
+      ],
+      "timeout_seconds": 1800,
+      "profiles": [
+        "full"
+      ]
+    }
+  ]
+}

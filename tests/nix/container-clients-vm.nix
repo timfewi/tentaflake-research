@@ -1,0 +1,154 @@
+{
+  pkgs,
+  nixpkgs,
+  self,
+}:
+let
+  inherit (pkgs) lib;
+  client = self.packages.${pkgs.stdenv.hostPlatform.system}.research-client;
+  policy = {
+    services.secureResearch = {
+      enable = true;
+      serviceUid = 4201;
+      egressUid = 4202;
+      vpnInterface = "fixture-vpn";
+      resolvers = [ "9.9.9.9" ];
+      containerClients = {
+        hermes-alpha.uid = 62001;
+        zeroclaw-beta.uid = 62002;
+      };
+    };
+    users.users.fixture = {
+      uid = 4100;
+      isNormalUser = true;
+    };
+    systemd.tmpfiles.rules = [ "d /run/research-vpn 0755 root root -" ];
+  };
+  evaluate =
+    extra:
+    (nixpkgs.lib.nixosSystem {
+      system = pkgs.stdenv.hostPlatform.system;
+      modules = [
+        self.nixosModules.default
+        policy
+        {
+          boot.isContainer = true;
+          system.stateVersion = "26.05";
+        }
+        extra
+      ];
+    }).config;
+  valid = evaluate { };
+  failures =
+    config: map (entry: entry.message) (lib.filter (entry: !entry.assertion) config.assertions);
+  duplicate = evaluate {
+    services.secureResearch.containerClients.zeroclaw-beta.uid = lib.mkForce 62001;
+  };
+  alias = evaluate {
+    users.users.unrelated = {
+      uid = 62001;
+      isNormalUser = true;
+    };
+  };
+  probe = pkgs.writeText "research-container-client-probe.py" ''
+    import json
+    import os
+    import subprocess
+    import sys
+
+    assert os.getuid() == 4100
+    assert not os.path.exists("/run/agent-research/socket")
+    assert not os.path.exists("/run/tentaflake-research")
+    child = subprocess.Popen(
+        ["${client}/bin/research-client", "--socket", "/run/client/socket"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    def send(message):
+        child.stdin.write(json.dumps(message) + "\n")
+        child.stdin.flush()
+    def receive(identifier):
+        while True:
+            line = child.stdout.readline()
+            assert line, "client exited before response"
+            response = json.loads(line)
+            if response.get("id") == identifier:
+                assert "error" not in response, response
+                return response["result"]
+    try:
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {},
+            "clientInfo": {"name": "container-capability-fixture", "version": "1"}}})
+        receive(1)
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        args = {"operation": sys.argv[1]}
+        if len(sys.argv) > 2:
+            args["job_id"] = sys.argv[2]
+        send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "research_job", "arguments": args}})
+        print(json.dumps(receive(2)))
+        child.stdin.close()
+        assert child.wait(timeout=10) == 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+  '';
+in
+assert failures valid == [ ];
+assert lib.any (lib.hasInfix "distinct upstream client UIDs") (failures duplicate);
+assert lib.any (lib.hasInfix "shared with other host users") (failures alias);
+assert valid.systemd.services."tentaflake-research-hermes-alpha@".serviceConfig.PrivateNetwork;
+assert
+  valid.systemd.services."tentaflake-research-hermes-alpha@".serviceConfig.RestrictAddressFamilies
+  == [ "AF_UNIX" ];
+assert valid.systemd.sockets.tentaflake-research-hermes-alpha.socketConfig.MaxConnections == 4;
+pkgs.testers.runNixOSTest {
+  name = "research-container-client-identities";
+  nodes.machine = {
+    imports = [
+      self.nixosModules.default
+      policy
+    ];
+    virtualisation.memorySize = 1024;
+    environment.systemPackages = [ pkgs.util-linux ];
+  };
+  testScript = ''
+    import json
+    import re
+
+    start_all()
+    for name in ["hermes-alpha", "zeroclaw-beta"]:
+        machine.wait_for_unit(f"tentaflake-research-{name}.socket")
+    machine.succeed("test $(stat -c %a /run/tentaflake-research) = 700")
+    # The same unprivileged UID cannot reach either host capability directory.
+    machine.fail("setpriv --reuid=4100 --regid=users --clear-groups test -S /run/tentaflake-research/hermes-alpha/socket")
+    machine.fail("setpriv --reuid=4100 --regid=users --clear-groups test -S /run/tentaflake-research/zeroclaw-beta/socket")
+
+    def call(name, operation, job=None):
+        suffix = "" if job is None else " " + job
+        result = machine.succeed(
+            "systemd-run --quiet --wait --pipe --collect "
+            "-p User=fixture -p PrivateNetwork=yes -p ProtectHome=yes "
+            "-p ProtectSystem=strict -p RuntimeMaxSec=45 "
+            "-p TemporaryFileSystem=/run "
+            f"-p BindReadOnlyPaths=/run/tentaflake-research/{name}:/run/client "
+            f"${pkgs.python3}/bin/python3 ${probe} {operation}{suffix}"
+        )
+        return json.loads(result)
+
+    a = call("hermes-alpha", "start")
+    b = call("zeroclaw-beta", "start")
+    assert not a.get("isError", False), a
+    assert not b.get("isError", False), b
+    job_a = a["structuredContent"]["job"]["id"]
+    job_b = b["structuredContent"]["job"]["id"]
+    assert re.fullmatch(r"[a-f0-9-]{36}", job_a), job_a
+    assert re.fullmatch(r"[a-f0-9-]{36}", job_b), job_b
+    # Both containers used UID 4100. The relay's host UID still owns each job.
+    assert not call("hermes-alpha", "status", job_a).get("isError", False)
+    assert not call("zeroclaw-beta", "status", job_b).get("isError", False)
+    assert call("zeroclaw-beta", "status", job_a).get("isError", False)
+    assert call("hermes-alpha", "status", job_b).get("isError", False)
+    machine.wait_for_unit("agent-research.service")
+  '';
+}

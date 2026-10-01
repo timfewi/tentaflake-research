@@ -1,0 +1,10 @@
+.direnv/
+result
+result-*
+target/
+__pycache__/
+.env
+.env.*
+*.pem
+*.key
+state/

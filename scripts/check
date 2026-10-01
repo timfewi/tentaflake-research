@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-fast}" in
+  fast)
+    cargo fmt --all -- --check
+    cargo clippy --offline --all-targets --all-features -- -D warnings
+    cargo test --offline --all-targets
+    deadnix --fail .
+    statix check .
+    nixfmt --check flake.nix nix/*.nix tests/nix/*.nix
+    shellcheck scripts/check
+    ;;
+  nixos-config)
+    : "${RESEARCH_TEST_NIXOS_CONFIG:?set the built NixOS module check output}"
+    cargo test --offline --features nixos-tests --test nixos-config
+    ;;
+  egress-control)
+    : "${RESEARCH_TEST_BWRAP:?set the pinned bubblewrap executable}"
+    : "${RESEARCH_TEST_CONTROL_CLOSURE:?set the controller runtime-closure file}"
+    task_target="${CARGO_TARGET_DIR:-$PWD/target}"
+    case "$task_target" in /*) ;; *) task_target="$PWD/$task_target" ;; esac
+    export RESEARCH_TEST_CONTROL="$task_target/debug/research-egress-control"
+    cargo build --offline --bin research-egress-control
+    cargo test --offline --features isolation-tests --test egress-control
+    ;;
+  vpn-observer)
+    : "${RESEARCH_TEST_BWRAP:?set the pinned bubblewrap executable}"
+    : "${RESEARCH_TEST_CONTROL_CLOSURE:?set the observer runtime-closure file}"
+    task_target="${CARGO_TARGET_DIR:-$PWD/target}"
+    case "$task_target" in /*) ;; *) task_target="$PWD/$task_target" ;; esac
+    export RESEARCH_TEST_VPN_OBSERVER="$task_target/debug/research-vpn-observer"
+    cargo build --offline --bin research-vpn-observer
+    cargo test --offline --features isolation-tests --test vpn-observer
+    ;;
+  worker-isolation)
+    : "${RESEARCH_TEST_BWRAP:?set the pinned bubblewrap executable}"
+    : "${RESEARCH_TEST_PDFINFO:?set the pinned pdfinfo executable}"
+    : "${RESEARCH_TEST_PDFTOTEXT:?set the pinned pdftotext executable}"
+    # The closure must also contain pdftoppm (poppler-utils) and tesseract; the
+    # fixture locates them there, or uses RESEARCH_TEST_PDFTOPPM /
+    # RESEARCH_TEST_TESSERACT when those are exported explicitly.
+    : "${RESEARCH_TEST_CLOSURE:?set the file listing the parser runtime closure (include poppler-utils and tesseract)}"
+    task_target="${CARGO_TARGET_DIR:-$PWD/target}"
+    case "$task_target" in /*) ;; *) task_target="$PWD/$task_target" ;; esac
+    export RESEARCH_TEST_WORKER="$task_target/debug/research-worker"
+    cargo build --offline --bin research-worker
+    cargo test --offline --features isolation-tests --test worker-isolation
+    ;;
+  browser-isolation)
+    : "${RESEARCH_TEST_BWRAP:?set the pinned bubblewrap executable}"
+    : "${RESEARCH_TEST_CHROMIUM:?set the pinned Chromium executable}"
+    : "${RESEARCH_TEST_CHROMIUM_SANDBOX:?set the pinned Chromium sandbox helper}"
+    : "${RESEARCH_TEST_FONTCONFIG:?set the pinned browser fontconfig file}"
+    : "${RESEARCH_TEST_CHROMIUM_CLOSURE:?set the Chromium runtime-closure file}"
+    cargo test --offline --features browser-tests --test browser-isolation --test browser-engine --test browser-session --test browser-service
+    ;;
+  service-activation)
+    : "${RESEARCH_TEST_SOCKET_ACTIVATE:?set the pinned systemd-socket-activate executable}"
+    task_target="${CARGO_TARGET_DIR:-$PWD/target}"
+    case "$task_target" in /*) ;; *) task_target="$PWD/$task_target" ;; esac
+    export RESEARCH_TEST_SERVICE="$task_target/debug/research-service"
+    cargo build --offline --bin research-service
+    cargo test --offline --features activation-tests --test service-activation
+    ;;
+  *)
+    echo 'usage: bash scripts/check [fast|nixos-config|egress-control|vpn-observer|worker-isolation|browser-isolation|service-activation]' >&2
+    exit 2
+    ;;
+esac

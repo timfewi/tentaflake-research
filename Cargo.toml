@@ -1,0 +1,120 @@
+[package]
+name = "secure-research"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Bounded public research through an isolated, VPN-protected service"
+license = "MIT"
+
+[features]
+isolation-tests = []
+activation-tests = []
+browser-tests = []
+nixos-tests = []
+
+[[test]]
+name = "nixos-config"
+path = "tests/nixos_config.rs"
+harness = false
+required-features = ["nixos-tests"]
+
+[[test]]
+name = "egress-control"
+path = "tests/egress_control.rs"
+harness = false
+required-features = ["isolation-tests"]
+
+[[test]]
+name = "vpn-observer"
+path = "tests/vpn_observer.rs"
+harness = false
+required-features = ["isolation-tests"]
+
+[[test]]
+name = "browser-service"
+path = "tests/browser_service.rs"
+harness = false
+required-features = ["browser-tests"]
+
+[[test]]
+name = "browser-session"
+path = "tests/browser_session.rs"
+harness = false
+required-features = ["browser-tests"]
+
+[[test]]
+name = "browser-engine"
+path = "tests/browser_engine.rs"
+harness = false
+required-features = ["browser-tests"]
+
+[[test]]
+name = "browser-isolation"
+path = "tests/browser_isolation.rs"
+harness = false
+required-features = ["browser-tests"]
+
+[[test]]
+name = "worker-isolation"
+path = "tests/worker_isolation.rs"
+harness = false
+required-features = ["isolation-tests"]
+
+[[test]]
+name = "service-activation"
+path = "tests/service_activation.rs"
+harness = false
+required-features = ["activation-tests"]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+async-tungstenite = { version = "0.32", default-features = false, features = ["tokio-runtime"] }
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+chromiumoxide = { version = "=0.9.1", default-features = false }
+chromiumoxide_types = "=0.9.1"
+clap = { version = "4", features = ["derive"] }
+dom_smoothie = "=0.18.0"
+dom_query = "=0.28.0"
+encoding_rs = "0.8"
+futures-util = "0.3"
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["tokio"] }
+http = "1"
+httparse = "1"
+ipnet = { version = "2", features = ["serde"] }
+listenfd = "1"
+nix = { version = "0.30", default-features = false, features = ["net"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "stream", "json", "query", "gzip", "brotli", "deflate", "zstd"] }
+rmcp = { version = "=3.3.0", default-features = false, features = ["server", "macros", "schemars", "transport-io"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+rustix = { version = "1", features = ["fs", "net", "process", "stdio", "thread"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+schemars = { version = "1", features = ["chrono04", "uuid1"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "process", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["codec", "rt", "io"] }
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+webpki-roots = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = "warn"
+
+[profile.release]
+overflow-checks = true
+strip = true
+
+[profile.dev]
+debug = 0
+incremental = false

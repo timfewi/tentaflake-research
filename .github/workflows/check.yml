@@ -1,0 +1,38 @@
+name: Check
+permissions:
+  contents: read
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+        with:
+          use-flakehub: false
+      - name: Fetch locked Cargo dependencies
+        run: nix develop --command cargo fetch --locked
+      - name: Source checks
+        run: nix develop --command project-check fast
+      - name: Redacted secret scan
+        run: nix develop --command gitleaks dir --redact --no-banner .
+      - name: Dependency advisories
+        run: nix develop --command osv-scanner scan source --lockfile Cargo.lock
+  packages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+        with:
+          use-flakehub: false
+      - run: nix develop --command project-check full

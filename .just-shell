@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Just passes the recipe as a shell string, followed by $0 and positional args.
+# Keep arguments out of diagnostics: recipes may pass credentials at runtime.
+set -euo pipefail
+
+# Bash invokes this exported hook when command lookup fails.
+# shellcheck disable=SC2329
+command_not_found_handle() {
+    printf 'recipe: required command not found: %s\n' "$1" >&2
+    return 127
+}
+export -f command_not_found_handle
+
+if bash -euo pipefail -c "$@"; then
+    exit 0
+else
+    status=$?
+fi
+
+case "$status" in
+    126|127)
+        printf 'recipe: blocked (exit %s): a command is missing or cannot be executed.\n' "$status" >&2
+        printf 'Enter the project toolchain with nix develop path:. (or reload direnv), then retry.\n' >&2
+        printf 'If it still fails, declare the missing tool in flake.nix devShells; project-check must be included too.\n' >&2
+        ;;
+    *)
+        printf 'recipe: failed (exit %s). See the command output above.\n' "$status" >&2
+        ;;
+esac
+exit "$status"
