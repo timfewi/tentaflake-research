@@ -50,10 +50,15 @@ The relay forwards through AF_UNIX with no IP networking. Shared internal
 container UIDs then do not merge job ownership at the research service. Each
 relay permits four connections and shares the aggregate research slice limits.
 Healthy stdio sessions may remain connected between tool calls; frontend MCP pings
-need not traverse the internal RPC. Stopping a relay socket terminates its accepted
+need not traverse the internal RPC. If the upstream session closes, a new tool call
+can reconnect using five bounded attempts with backoff. Interrupted calls report
+`cancelled` without replaying their operations; explicit client close stays final.
+Stopping a relay socket terminates its accepted
 relay instances. Stopping the upstream socket also stops the client sockets. The
-container-client VM exercises cross-job refusal, a 65-second idle gap and live
-socket revocation.
+socket must be stopped to revoke admission; stopping only the socket-activated
+service allows a new connection to start it again. The container-client VM exercises
+cross-job refusal, a 65-second idle gap, live socket revocation and recovery after
+a service crash without restarting the stdio client.
 
 Practical mode archives evidence with bounded retention; strict mode uses ephemeral
 job content. Budget/accounting data remains persistent. Allocate disk headroom

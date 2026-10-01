@@ -89,12 +89,24 @@ let
             # MCP frontend pings do not traverse the internal research RPC.
             # A healthy stdio client must survive a normal gap between tool calls.
             time.sleep(65)
-        args = {"operation": "start" if sys.argv[1] == "idle-start" else sys.argv[1]}
+        args = {"operation": "start" if sys.argv[1] in ("idle-start", "recover") else sys.argv[1]}
         if len(sys.argv) > 2:
             args["job_id"] = sys.argv[2]
         send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
             "name": "research_job", "arguments": args}})
-        print(json.dumps(receive(2)))
+        result = receive(2)
+        if sys.argv[1] == "recover":
+            assert not result.get("isError", False), result
+            print("ready", flush=True)
+            while not os.path.exists("/run/recovery/resume"):
+                time.sleep(0.1)
+            # Keep the same stdio process and issue a new operation after the
+            # host has killed and recovered the upstream research service.
+            assert child.poll() is None
+            send({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                "name": "research_job", "arguments": {"operation": "start"}}})
+            result = receive(3)
+        print(json.dumps(result), flush=True)
         child.stdin.close()
         assert child.wait(timeout=10) == 0
     finally:
@@ -178,5 +190,34 @@ pkgs.testers.runNixOSTest {
     assert not call("zeroclaw-beta", "status", job_b).get("isError", False)
     machine.succeed("systemctl stop relay-stop-fixture.service")
     machine.wait_for_unit("agent-research.service")
+
+    with subtest("same stdio client reconnects after upstream service crash"):
+        machine.succeed(
+            "mkdir -p /run/research-recovery-fixture; "
+            "systemd-run --quiet --unit=research-recovery-fixture "
+            "-p User=fixture -p PrivateNetwork=yes -p ProtectHome=yes "
+            "-p ProtectSystem=strict -p RuntimeMaxSec=120 "
+            "-p TemporaryFileSystem=/run "
+            "-p 'BindReadOnlyPaths=/run/tentaflake-research/zeroclaw-beta:/run/client "
+            "/run/research-recovery-fixture:/run/recovery' "
+            "-p StandardOutput=file:/run/research-recovery-output "
+            "${pkgs.python3}/bin/python3 ${probe} recover"
+        )
+        machine.wait_until_succeeds("grep -Fx ready /run/research-recovery-output")
+        old_pid = int(machine.succeed("systemctl show -p MainPID --value agent-research.service").strip())
+        assert old_pid > 0
+        machine.succeed(f"kill -9 {old_pid}")
+        machine.wait_until_succeeds(
+            "systemctl is-active --quiet agent-research.service && "
+            f"test $(systemctl show -p MainPID --value agent-research.service) -ne {old_pid}"
+        )
+        machine.succeed("touch /run/research-recovery-fixture/resume")
+        machine.wait_until_succeeds("grep -q '^{' /run/research-recovery-output")
+        recovered = json.loads(machine.succeed("tail -n 1 /run/research-recovery-output"))
+        assert not recovered.get("isError", False), recovered
+        machine.wait_until_succeeds(
+            "test $(systemctl show -p ActiveState --value research-recovery-fixture.service) = inactive"
+        )
+        machine.succeed("test $(systemctl show -p Result --value research-recovery-fixture.service) = success")
   '';
 }
