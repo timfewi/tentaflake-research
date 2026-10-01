@@ -31,3 +31,10 @@ target; the minimal root now supplies it without exposing host files.
 The redacted Gitleaks scan found no leaks in the extracted source; OSV found no
 known advisories in the 330-package Cargo lockfile. These are time-bounded scans,
 not a guarantee that all credentials or vulnerabilities can be detected.
+
+Relay lifecycle regression: a 65-second gap between initialization and a tool
+call reproduced the old transport timeout. Relays now retain healthy sessions;
+connection counts, memory, processes, IPC frames and job budgets remain bounded.
+The socket-stop fixture checks revocation of already accepted instances. The current-source
+fast gate and real VM fixture passed on 2026-10-01, including the 65-second gap
+and revocation while an accepted relay is running.
