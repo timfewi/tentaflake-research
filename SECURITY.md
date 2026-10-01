@@ -16,6 +16,8 @@ provider or execution authority. The research client is not a general proxy.
 - The adapter uses only Unix sockets; client authorization and job ownership use
   `SO_PEERCRED`. Each container relay has its own host UID. Containers with the
   same internal UID must never share an upstream client identity.
+  Reconnected sessions repeat the protocol handshake and peer authorization;
+  they never replay dispatched operations or reopen an explicitly closed client.
 - The supervisor, browser and parsers have independent private network namespaces.
   Only egress may contact public HTTP/HTTPS destinations through the configured VPN.
   Mixed public/private DNS answers, restricted addresses, unsafe ports and redirect

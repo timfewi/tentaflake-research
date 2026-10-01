@@ -10,6 +10,8 @@
   networking. Retrieved content cannot grant capabilities or change policy.
 - Preserve job ownership by Unix peer UID, bounded admission and fail-closed VPN
   readiness. Container relays need distinct host UIDs even if containers share UIDs.
+- Client recovery must never replay dispatched operations or reopen after explicit
+  close. Every new session repeats protocol negotiation and peer-UID authorization.
 - Keep README.md, SECURITY.md, docs/ and checks synchronized with behavior.
 - Use Conventional Commits and DCO signoff (`git commit -s`).
 - Missing tools or offline dependencies are environment blockers, not failures.

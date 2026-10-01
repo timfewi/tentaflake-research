@@ -19,6 +19,8 @@ agent -> LLM broker -> model provider
 The client has no HTTP transport and holds no provider keys. The service checks
 job ownership and budgets; workers receive only their required files. Egress
 checks every target and DNS answer and connects to a validated numeric address.
+After a lost Unix session, new calls can reconnect; interrupted operations are
+never replayed automatically. Explicit client close remains final.
 The NixOS firewall restricts egress to the configured VPN, including established
 connections. Missing readiness closes admission. Sources retain provenance,
 hashes, raw evidence, coverage and truncation information.

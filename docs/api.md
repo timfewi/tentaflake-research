@@ -220,6 +220,12 @@ their evidence. A dropped client cancels the jobs it created. A dropped MCP call
 sends request cancellation, while leaving its job available. Finish/cancel waits
 for worker and storage operations to release their leases before cleanup.
 
+A lost Unix session fails its dispatched calls with `cancelled`; those operations
+are never retried automatically, since their effects may already have occurred.
+Undispatched calls can open a fresh session with the same bounded startup retry
+policy, repeating the handshake and peer-UID checks. Cancelling a reconnect does
+not poison later calls. Explicit client close prevents further connections.
+
 A root-authored egress lease pauses admission while draining. Offline or changed
 exit generation interrupts jobs and retains practical evidence. Reading saved
 sources and inspecting jobs does not require working egress. Typical failures

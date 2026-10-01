@@ -6,7 +6,7 @@ use crate::error::{ErrorCode, Result};
 use crate::protocol::{self, Operation, Outcome, Request, Response, Tool, VERSION};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
@@ -37,6 +37,10 @@ impl Drop for Bridge {
 
 impl Bridge {
     pub async fn connect(socket: &Path) -> Result<Self> {
+        Ok(Self::from_stream(socket, Self::open(socket).await?))
+    }
+
+    async fn open(socket: &Path) -> Result<UnixStream> {
         let mut stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(socket))
             .await
             .map_err(|_| ErrorCode::Timeout)?
@@ -72,14 +76,18 @@ impl Bridge {
         })
         .await
         .map_err(|_| ErrorCode::Timeout)??;
+        Ok(stream)
+    }
+
+    fn from_stream(socket: &Path, stream: UnixStream) -> Self {
         let (commands, incoming) = mpsc::channel(16);
         let stop = CancellationToken::new();
-        let task = tokio::spawn(run(stream, incoming, stop.clone()));
-        Ok(Self {
+        let task = tokio::spawn(run(socket.to_owned(), stream, incoming, stop.clone()));
+        Self {
             commands,
             stop,
             task: tokio::sync::Mutex::new(Some(task)),
-        })
+        }
     }
 
     /// Connect to the service, retrying a bounded number of times with a short
@@ -89,12 +97,19 @@ impl Bridge {
     /// client from exiting immediately with a "Connection closed" error during
     /// that window. Every attempt opens a fresh connection.
     pub async fn connect_with_retry(socket: &Path) -> Result<Self> {
+        Ok(Self::from_stream(
+            socket,
+            Self::open_with_retry(socket).await?,
+        ))
+    }
+
+    async fn open_with_retry(socket: &Path) -> Result<UnixStream> {
         const MAX_ATTEMPTS: u32 = 5;
         const BASE_BACKOFF: Duration = Duration::from_millis(250);
         let mut attempt: u32 = 0;
         loop {
-            match Self::connect(socket).await {
-                Ok(bridge) => return Ok(bridge),
+            match Self::open(socket).await {
+                Ok(stream) => return Ok(stream),
                 Err(error) => {
                     attempt += 1;
                     if attempt >= MAX_ATTEMPTS {
@@ -149,8 +164,50 @@ impl Bridge {
     }
 }
 
-async fn run(stream: UnixStream, mut commands: mpsc::Receiver<Command>, stop: CancellationToken) {
+async fn run(
+    socket: PathBuf,
+    mut stream: UnixStream,
+    mut commands: mpsc::Receiver<Command>,
+    stop: CancellationToken,
+) {
     let _stop_on_exit = stop.clone().drop_guard();
+    let mut first = None;
+    loop {
+        run_session(stream, &mut commands, stop.clone(), first.take()).await;
+        // Dispatched work has already failed and is never replayed. Only an
+        // undispatched command can request a fresh, fully checked session.
+        loop {
+            let command = tokio::select! {
+                biased;
+                _ = stop.cancelled() => return,
+                command = commands.recv() => match command { Some(command) => command, None => return },
+            };
+            let connection = tokio::select! {
+                biased;
+                _ = stop.cancelled() => return,
+                _ = command.stop.cancelled() => Err(ErrorCode::Cancelled),
+                connection = Bridge::open_with_retry(&socket) => connection,
+            };
+            match connection {
+                Ok(connected) => {
+                    stream = connected;
+                    first = Some(command);
+                    break;
+                }
+                Err(error) => {
+                    let _ = command.reply.send(Err(error));
+                }
+            }
+        }
+    }
+}
+
+async fn run_session(
+    stream: UnixStream,
+    commands: &mut mpsc::Receiver<Command>,
+    stop: CancellationToken,
+    mut first: Option<Command>,
+) {
     let (mut reader, mut writer) = stream.into_split();
     let (responses, mut incoming) = mpsc::channel(32);
     let reading = tokio::spawn(async move {
@@ -192,7 +249,7 @@ async fn run(stream: UnixStream, mut commands: mpsc::Receiver<Command>, stop: Ca
                 if acknowledgements.len() >= 32 { break; }
                 Operation::Cancel { request_id: id }
             }
-            command = commands.recv() => {
+            command = async { match first.take() { Some(command) => Some(command), None => commands.recv().await } } => {
                 let Some(command) = command else { break; };
                 if command.stop.is_cancelled() { let _ = command.reply.send(Err(ErrorCode::Cancelled)); continue; }
                 if pending.len() >= 16 { let _ = command.reply.send(Err(ErrorCode::Capacity)); continue; }
@@ -254,6 +311,25 @@ mod tests {
         })
     }
 
+    async fn reply(stream: &mut UnixStream, id: u64, value: Value) {
+        protocol::write_frame(
+            stream,
+            &Response {
+                version: VERSION,
+                id,
+                outcome: Outcome::Result { value },
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn handshake(stream: &mut UnixStream) {
+        let request: Request = protocol::read_frame(stream).await.unwrap().unwrap();
+        assert!(matches!(request.operation, Operation::Hello));
+        reply(stream, request.id, hello_reply()).await;
+    }
+
     #[tokio::test]
     async fn connect_with_retry_waits_for_a_transiently_absent_listener() {
         let directory = tempfile::tempdir().unwrap();
@@ -268,23 +344,151 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let listener = UnixListener::bind(&path).unwrap();
             let (mut stream, _) = listener.accept().await.unwrap();
-            let request: Request = protocol::read_frame(&mut stream).await.unwrap().unwrap();
-            assert!(matches!(request.operation, Operation::Hello));
-            protocol::write_frame(
-                &mut stream,
-                &Response {
-                    version: VERSION,
-                    id: request.id,
-                    outcome: Outcome::Result {
-                        value: hello_reply(),
-                    },
-                },
-            )
-            .await
-            .unwrap();
+            handshake(&mut stream).await;
         });
 
         let bridge = Bridge::connect_with_retry(&socket).await.unwrap();
+        bridge.close().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnects_future_calls_without_replaying_dispatched_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("research.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            for marker in [1, 2] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                handshake(&mut stream).await;
+                let request: Request = protocol::read_frame(&mut stream).await.unwrap().unwrap();
+                let Operation::Call { arguments, .. } = request.operation else {
+                    panic!("expected a fresh call");
+                };
+                assert_eq!(arguments["marker"], marker);
+                if marker == 2 {
+                    reply(&mut stream, request.id, serde_json::json!({"fresh": true})).await;
+                }
+                // The first call reached the peer, but its response is lost.
+            }
+        });
+        let bridge = Bridge::connect(&socket).await.unwrap();
+        assert_eq!(
+            bridge
+                .call(
+                    Tool::ResearchJob,
+                    serde_json::json!({"marker": 1}),
+                    CancellationToken::new()
+                )
+                .await
+                .unwrap_err(),
+            ErrorCode::Cancelled
+        );
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            bridge
+                .call(Tool::ResearchJob, Value::Null, cancelled)
+                .await
+                .unwrap_err(),
+            ErrorCode::Cancelled
+        );
+        let fresh = tokio::time::timeout(
+            Duration::from_secs(2),
+            bridge.call(
+                Tool::ResearchJob,
+                serde_json::json!({"marker": 2}),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(fresh["fresh"], true);
+        bridge.close().await;
+        assert_eq!(
+            bridge
+                .call(Tool::ResearchJob, Value::Null, CancellationToken::new())
+                .await
+                .unwrap_err(),
+            ErrorCode::Cancelled
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_reconnect_does_not_poison_the_next_call() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("research.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (connecting, started) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handshake(&mut stream).await;
+            let _: Request = protocol::read_frame(&mut stream).await.unwrap().unwrap();
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let hello: Request = protocol::read_frame(&mut stream).await.unwrap().unwrap();
+            assert!(matches!(hello.operation, Operation::Hello));
+            connecting.send(()).unwrap();
+            // Hold the handshake. Cancellation must close this connection
+            // without sending a call, even before the five-second timeout.
+            assert!(
+                protocol::read_frame::<_, Request>(&mut stream)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handshake(&mut stream).await;
+            let request: Request = protocol::read_frame(&mut stream).await.unwrap().unwrap();
+            let Operation::Call { arguments, .. } = request.operation else {
+                panic!("expected a fresh call");
+            };
+            assert_eq!(arguments["marker"], 3);
+            reply(&mut stream, request.id, serde_json::json!({"fresh": true})).await;
+        });
+        let bridge = std::sync::Arc::new(Bridge::connect(&socket).await.unwrap());
+        assert_eq!(
+            bridge
+                .call(Tool::ResearchJob, Value::Null, CancellationToken::new())
+                .await
+                .unwrap_err(),
+            ErrorCode::Cancelled
+        );
+        let stop = CancellationToken::new();
+        let client = bridge.clone();
+        let cancel = stop.clone();
+        let pending =
+            tokio::spawn(async move { client.call(Tool::ResearchJob, Value::Null, cancel).await });
+        tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .unwrap()
+            .unwrap();
+        stop.cancel();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err(),
+            ErrorCode::Cancelled
+        );
+        let fresh = tokio::time::timeout(
+            Duration::from_secs(2),
+            bridge.call(
+                Tool::ResearchJob,
+                serde_json::json!({"marker": 3}),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(fresh["fresh"], true);
         bridge.close().await;
         server.await.unwrap();
     }
