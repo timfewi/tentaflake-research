@@ -11,9 +11,33 @@ nix develop --command cargo test --locked --offline --test service_rpc
 ```
 
 The fast gate runs Rust formatting, all-target/all-feature Clippy with warnings
-denied, default-feature tests, Nix lints/formatting and ShellCheck. OS fixtures are
+denied, client-only and default-feature tests, Nix lints/formatting and ShellCheck.
+It evaluates the independent client package and rejects service libraries in its
+normal Cargo dependency graph. OS fixtures are
 compiled but need their own runtime checks. `project-check full` builds the three
 Rust package outputs and configuration checks; it does not run every VM.
+
+CI reports the small client separately from service checks and package checks.
+Cargo target caches are outside the source tree and keyed by the locked toolchain
+and manifests; client and service caches are separate. Superseded PR runs are
+cancelled. No builder or cache account is required by the runtime. An optional
+remote Nix builder (including nixbuild.net) can build packages, but VM fixtures
+also need compatible runtime/KVM support; voucher CPU-hours are not runner hours.
+
+Check or build only the socket clients with:
+
+```sh
+bash scripts/check client
+cargo build --locked --offline --no-default-features --bin research-client --bin research-curl
+```
+
+Use the pinned shell for this command. The default `service` Cargo feature keeps
+the existing service, egress and worker build. Shared request types and protocol
+remain provider-independent; the normal client graph has no Chromium, HTTP/TLS,
+DNS, HTML extraction or SQLite libraries. Client package sources exclude
+service/provider implementation files, so changes confined to those files do
+not invalidate the client package. Fetching sources still uses the shared lockfile.
+Use `path:.` when evaluating a working tree containing new, unstaged Nix files.
 
 ```sh
 nix build --no-link .#research-service .#research-client .#research-egress

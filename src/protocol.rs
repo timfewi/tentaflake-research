@@ -174,3 +174,17 @@ mod tests {
         );
     }
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReportChunk {
+    pub report_id: uuid::Uuid,
+    pub encoding: String,
+    pub content: String,
+    pub start: u64,
+    pub end: u64,
+    pub total: u64,
+    pub sha256: String,
+    pub truncated: bool,
+    pub next_start: Option<u64>,
+    pub untrusted: bool,
+}

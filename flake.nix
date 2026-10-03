@@ -32,41 +32,10 @@
           pkgs.tesseract
         ];
       };
-      package = pkgs.rustPlatform.buildRustPackage {
-        pname = "secure-research";
-        version = "0.1.0";
-        src = pkgs.lib.fileset.toSource {
-          root = ./.;
-          fileset = pkgs.lib.fileset.unions [
-            ./Cargo.toml
-            ./Cargo.lock
-            ./src
-            # Deployment fixture edits do not change the Rust package inputs.
-            (pkgs.lib.fileset.difference ./tests ./tests/nix)
-          ];
-        };
-        cargoLock.lockFile = ./Cargo.lock;
-        outputs = [
-          "out"
-          "client"
-          "egress"
-        ];
-        strictDeps = true;
-        nativeBuildInputs = [ pkgs.pkg-config ];
-        postInstall = ''
-          mkdir -p "$client/bin" "$egress/bin"
-          mv "$out/bin/research-client" "$client/bin/"
-          mv "$out/bin/research-curl" "$client/bin/"
-          mv "$out/bin/research-egress" "$egress/bin/"
-          mv "$out/bin/research-egress-control" "$egress/bin/"
-          mv "$out/bin/research-vpn-observer" "$egress/bin/"
-        '';
-        meta = {
-          platforms = [ system ];
-          license = pkgs.lib.licenses.mit;
-          homepage = "https://github.com/timfewi/tentaflake-research";
-          description = "Isolated, bounded public research for AI agents";
-        };
+      package = import ./nix/package.nix { inherit pkgs; };
+      clientPackage = import ./nix/package.nix {
+        inherit pkgs;
+        clientOnly = true;
       };
     in
     {
@@ -74,7 +43,7 @@
       packages.${system} = {
         default = package;
         research-service = package;
-        research-client = package.client;
+        research-client = clientPackage;
         research-egress = package.egress;
         research-browser-fonts = browserFonts;
       };
@@ -82,7 +51,7 @@
         let
           client = {
             type = "app";
-            program = "${package.client}/bin/research-client";
+            program = "${clientPackage}/bin/research-client";
           };
         in
         {
@@ -91,7 +60,7 @@
           secure-research-tool = client;
           research-curl = {
             type = "app";
-            program = "${package.client}/bin/research-curl";
+            program = "${clientPackage}/bin/research-curl";
           };
         };
       devShells.${system}.default = pkgs.mkShell {
@@ -115,6 +84,7 @@
       formatter.${system} = pkgs.nixfmt;
       checks.${system} = {
         core = package;
+        client-packaging = import ./tests/nix/client-packaging.nix { inherit pkgs self; };
         parser-tools = pkgs.runCommand "research-parser-tools-check" { } ''
           for binary in pdfinfo pdftotext pdftoppm; do
             test -x "${pkgs.poppler-utils}/bin/$binary"

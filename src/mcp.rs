@@ -28,7 +28,7 @@ impl Adapter {
 
     #[tool(
         name = "research_job",
-        description = "Start, inspect, finish or cancel a bounded public-research job. Returns job.id, remaining job budgets and granted capabilities with per-request cost ceilings. Search-query slots exclude model judgments. Reuse the job; finish/cancel it to release capacity. Sources with storage_not_permitted remain readable within the job and are removed at job end."
+        description = "Inspect effective optional adapters with operation=providers without creating a job or making network requests; or start, inspect, finish or cancel a bounded public-research job. Returns job.id, remaining job budgets and granted capabilities with per-request cost ceilings. Search-query slots exclude model judgments. Reuse the job; finish/cancel it to release capacity. Sources with storage_not_permitted remain readable within the job and are removed at job end."
     )]
     async fn job(
         &self,

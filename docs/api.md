@@ -20,7 +20,7 @@ service-authored categorical fields and never include tool input or source data.
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
-| `research_job` | `operation`: `start`, `status`, `finish`, `cancel`; `job_id` except for start; optional reduced `limits` on start | Job state, limits, usage, remaining budgets, granted capabilities and available source IDs |
+| `research_job` | `operation`: `providers`, `start`, `status`, `finish`, `cancel`; `job_id` for status/finish/cancel; optional reduced `limits` on start | Job state, limits, usage, remaining budgets, granted capabilities and available source IDs |
 | `research_search` | `job_id`, `queries`: objects with `q`, optional `count`, `language`, `country`, `freshness` | Per-query state, snippets, source, provider, cache hit, coverage and usage |
 | `research_fetch` | `job_id`, `urls`, optional `mode`: `auto`, `http`, `browser`, `provider`; optional `crawl` (`pages`, `depth`) with `http`/`auto` | Per-URL state, source, raw-source ID, link preview, complete links representation, extraction error, JavaScript need and an optional bounded-crawl summary |
 | `research_browser` | `action`: `open`, `read`, `follow_link`, `expand`, `scroll`, `close`, with job/session/versioned reference as applicable | Session ID, observed page/references, DOM and text sources, cumulative HTTP receipts, partial/error state |
@@ -53,6 +53,12 @@ UTC-day spending cap. Search attempts consume query slots; summaries consume
 requests, bytes, time and money without consuming extra search slots. Cache hits
 do not incur another upstream charge.
 
+`{"operation":"providers"}` returns the same effective `capabilities` before a
+job is started. It allocates no job, consumes no job budget and makes no network
+requests, so it remains available when egress is offline or job capacity is full.
+Unix peer authorization still applies. This reports operator configuration, not
+live provider reachability or tariffs.
+
 Top-level `capabilities` lists installed adapters with effective operator grants,
 filtered by privacy, under `search`, `scrape` and `summarize`.
 Each entry has `provider`, `request_micro_usd` (the configured reservation ceiling,
@@ -81,6 +87,13 @@ keeps fragments so hash-based pages remain addressable.
 is rendered when the operator has explicitly enabled and configured the browser.
 HTTP policy, access or extraction errors never trigger rendering. Without an
 enabled browser, the HTTP result retains its `javascript_required` flag.
+A long navigation/footer does not make an empty application shell readable:
+`page_shell` marks partial evidence. Paired static React streaming payloads can
+be recovered as derived text and links without executing scripts; they carry
+`streaming_html_recovered` and remain partial because the browser placement was
+not observed. Raw HTML is retained separately. `readability_unavailable` means
+the optional main-content projection failed; it does not make preserved full
+text incomplete by itself.
 
 `browser` uses a one-shot reading session. Its result includes `closed: true`;
 the returned session ID cannot be used for further actions. Browser work within a
@@ -107,6 +120,9 @@ clamped down to the operator's `limits.crawl_pages` (default 16, maximum 64) and
 values outside the API range are rejected. Crawling is single-origin per call:
 multiple seed URLs are crawled independently and links never cross an origin
 boundary.
+
+The crawl tracks both requested and final redirect URLs before following links,
+so a self-link to an already fetched redirect destination is not requested again.
 
 Every crawled page runs the normal fetch path, so redirects, retries, robots,
 cache, budgets and immutable evidence match a directly requested fetch, and each

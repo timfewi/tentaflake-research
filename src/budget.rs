@@ -12,18 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(default, deny_unknown_fields)]
-pub struct RequestedLimits {
-    pub seconds: Option<u64>,
-    pub bytes: Option<u64>,
-    pub micro_usd: Option<u64>,
-    pub queries: Option<u32>,
-    pub documents: Option<u32>,
-    pub requests: Option<u32>,
-    pub pdf_pages: Option<u32>,
-    pub browser_actions: Option<u32>,
-}
+pub use crate::api::RequestedLimits;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

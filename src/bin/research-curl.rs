@@ -8,8 +8,7 @@ use secure_research::{
     bridge::Bridge,
     config::{MAX_HTTP_BODY_BYTES, MAX_JOB_SECONDS, MAX_REPORT_BYTES},
     policy::{PublicUrl, sha256},
-    protocol::Tool,
-    reports::ReportChunk,
+    protocol::{ReportChunk, Tool},
 };
 use serde_json::{Value, json};
 use std::{path::PathBuf, time::Duration};

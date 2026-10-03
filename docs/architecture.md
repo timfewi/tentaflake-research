@@ -7,6 +7,13 @@ provides their identity, filesystem, network and resource boundaries. Consult
 
 ## Authority and content
 
+The stdio client and service share request schemas and the versioned Unix
+protocol. Provider adapters and execution backends belong to the optional
+`service` Cargo feature; the standalone client is a transport adapter with no
+provider credentials or HTTP/browser stack. The public five-tool contract does
+not include domain-specific lead/contact enrichment. New adapters must retain
+explicit grants and the existing budget, evidence and protected-egress boundary.
+
 Only five research operations cross the agent socket. A source URL, title,
 snippet, HTML node or PDF string never becomes executable configuration, a file
 path, credential name, shell command or additional capability. Machine failures

@@ -568,6 +568,9 @@ impl Service {
             Tool::ResearchJob => {
                 let args: JobArgs = parse(arguments)?;
                 let (job, include_sources) = match args {
+                    JobArgs::Providers {} => {
+                        return Ok(json!({"capabilities": self.capabilities(), "untrusted": true}));
+                    }
                     JobArgs::Start { limits } => (self.start(owner, connection, limits)?, false),
                     JobArgs::Status { job_id } => (self.ledger.get(owner, job_id)?, true),
                     JobArgs::Finish { job_id } => (
@@ -873,8 +876,14 @@ impl Service {
         // the seed origin.
         let crawl_summary = match crawl {
             Some(crawl) => Some(
-                self.crawl_seed(context, &target, &record.links, crawl)
-                    .await,
+                self.crawl_seed(
+                    context,
+                    &target,
+                    &record.source.final_url,
+                    &record.links,
+                    crawl,
+                )
+                .await,
             ),
             None => None,
         };
@@ -898,6 +907,8 @@ impl Service {
                         SourceWarning::PartialExtraction
                             | SourceWarning::Truncated
                             | SourceWarning::JavascriptRequired
+                            | SourceWarning::PageShell
+                            | SourceWarning::StreamingHtmlRecovered
                     )
                 }) {
                 ItemState::Partial
@@ -998,6 +1009,7 @@ impl Service {
         &self,
         context: &Context,
         seed: &PublicUrl,
+        seed_final_url: &str,
         seed_links: &[crate::worker::Link],
         crawl: CrawlArgs,
     ) -> Value {
@@ -1009,6 +1021,9 @@ impl Service {
         let max_depth = u32::from(crawl.depth).min(self.config.limits.crawl_depth);
         let mut visited: HashSet<String> = HashSet::new();
         visited.insert(seed.request_url().to_string());
+        if let Ok(final_url) = PublicUrl::parse(seed_final_url) {
+            visited.insert(final_url.request_url().to_string());
+        }
         let mut queue: VecDeque<(PublicUrl, u32)> = VecDeque::new();
         if max_depth >= 1 {
             for link in seed_links {
@@ -1082,6 +1097,9 @@ impl Service {
                         }
                     };
                     fetched += 1;
+                    if let Ok(final_url) = PublicUrl::parse(&record.source.final_url) {
+                        visited.insert(final_url.request_url().to_string());
+                    }
                     if record.error.is_some() {
                         partial = true;
                     }
@@ -1671,6 +1689,8 @@ fn crawl_page_data(depth: u32, record: &FetchRecord) -> Value {
                 SourceWarning::PartialExtraction
                     | SourceWarning::Truncated
                     | SourceWarning::JavascriptRequired
+                    | SourceWarning::PageShell
+                    | SourceWarning::StreamingHtmlRecovered
             )
         }) {
         ItemState::Partial

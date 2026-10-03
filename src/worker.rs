@@ -156,6 +156,11 @@ pub enum ExtractionWarning {
     LinksOmitted,
     TitleTruncated,
     ReadabilityUnavailable,
+    /// Static React streaming payloads were recovered, without running scripts
+    /// or claiming that their browser placement was observed.
+    StreamingHtmlRecovered,
+    PageShell,
+    JavascriptRequired,
     /// Text came from local OCR rather than an embedded text layer.
     OcrApplied,
 }
@@ -247,11 +252,19 @@ pub fn parse_html(bytes: &[u8], base: &PublicUrl, content_type: &str) -> Result<
     if !document.select("#challenge-form").is_empty() {
         return Err(ErrorCode::AccessBlocked);
     }
-    let title = document.select("title").text().to_string();
+    let title = document.select_single("head > title").text().to_string();
     if title.len() > 4096 {
         warnings.push(ExtractionWarning::TitleTruncated);
     }
     let title = byte_prefix(&title, 4096).to_owned();
+    let has_script = !document.select("script").is_empty();
+    // React streams already-rendered HTML in hidden S:* containers. Only
+    // statically paired B:*/S:* payloads are included as derived content; other
+    // hidden elements remain excluded. No source script is evaluated.
+    let streamed = recover_streamed_html(&document);
+    if streamed {
+        warnings.push(ExtractionWarning::StreamingHtmlRecovered);
+    }
     document
         .select("script,style,template,noscript,[hidden],[aria-hidden=true]")
         .remove();
@@ -279,10 +292,22 @@ pub fn parse_html(bytes: &[u8], base: &PublicUrl, content_type: &str) -> Result<
     // Text-node content preserves Unicode and whitespace. Layout whitespace is
     // not invented here; the raw HTML remains a separate archived representation.
     let text = document.select("body").text().to_string();
+    let content = document.clone();
+    content
+        .select("nav,header,footer,aside,[role=navigation]")
+        .remove();
+    let meaningful = content.select("body").text();
+    let chars = meaningful.trim().chars().count();
+    if chars == 0 {
+        warnings.push(ExtractionWarning::PageShell);
+    }
+    if streamed || (has_script && chars < 200) {
+        warnings.push(ExtractionWarning::JavascriptRequired);
+    }
     // Embedded CAPTCHA widgets in an otherwise readable article are not an
     // access gate. A short challenge-only page is reported as blocked, and is
     // never a trigger for browser escalation or automated challenge solving.
-    if text.chars().count() < 200 && !document.select("[data-sitekey],iframe[src*='recaptcha'],iframe[src*='hcaptcha'],input[name='cf-turnstile-response']").is_empty() {
+    if chars < 200 && !document.select("[data-sitekey],iframe[src*='recaptcha'],iframe[src*='hcaptcha'],input[name='cf-turnstile-response']").is_empty() {
         return Err(ErrorCode::AccessBlocked);
     }
     let config = dom_smoothie::Config {
@@ -305,10 +330,66 @@ pub fn parse_html(bytes: &[u8], base: &PublicUrl, content_type: &str) -> Result<
         title,
         pages: vec![text],
         readable_text,
-        extraction_version: format!("dom_query/0.28.0;text-nodes;{encoding}"),
+        extraction_version: format!("research-html/v2;dom_query/0.28.0;text-nodes;{encoding}"),
         links,
         warnings,
     })
+}
+
+fn recover_streamed_html(document: &dom_query::Document) -> bool {
+    let mut pairs = HashSet::new();
+    for script in document.select("script:not([src])").iter() {
+        let text = script.text();
+        for suffix in text.split("$RC(").skip(1) {
+            // Accept only two short literal IDs, never expressions or arbitrary
+            // selectors. This recognizes data, not authority or executable JS.
+            let Some((first, rest)) = stream_id(suffix.trim_start()) else {
+                continue;
+            };
+            let Some(rest) = rest.trim_start().strip_prefix(',') else {
+                continue;
+            };
+            let Some((second, rest)) = stream_id(rest.trim_start()) else {
+                continue;
+            };
+            if rest.trim_start().starts_with(')')
+                && first.strip_prefix("B:") == second.strip_prefix("S:")
+                && first.starts_with("B:")
+                && second.starts_with("S:")
+                && pairs.len() < 256
+            {
+                pairs.insert((first.to_owned(), second.to_owned()));
+            }
+        }
+    }
+    let mut recovered = false;
+    for segment in document.select("div[hidden][id]").iter() {
+        let Some(id) = segment.attr("id") else {
+            continue;
+        };
+        if let Some((boundary, _)) = pairs.iter().find(|(_, payload)| payload == id.as_ref())
+            && document
+                .select("template[id]")
+                .iter()
+                .any(|template| template.attr("id").as_deref() == Some(boundary))
+        {
+            segment.remove_attr("hidden");
+            recovered = true;
+        }
+    }
+    recovered
+}
+
+fn stream_id(input: &str) -> Option<(&str, &str)> {
+    let quote = input.chars().next()?;
+    if !matches!(quote, '\'' | '"') {
+        return None;
+    }
+    let rest = &input[1..];
+    let end = rest.char_indices().take(65).find(|(_, c)| *c == quote)?.0;
+    let id = &rest[..end];
+    (id.len() > 2 && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b':'))
+        .then_some((id, &rest[end + 1..]))
 }
 
 pub fn parse_text(bytes: &[u8], content_type: &str) -> Result<ParsedDocument> {
@@ -1045,6 +1126,14 @@ mod tests {
             ),
             Err(ErrorCode::AccessBlocked)
         ));
+        let shell_challenge = format!(
+            "<nav>{}</nav><main><div data-sitekey='captcha'>Verify you are human</div></main><script src='/challenge.js'></script>",
+            "Navigation ".repeat(50)
+        );
+        assert!(matches!(
+            parse_html(shell_challenge.as_bytes(), &base, "text/html"),
+            Err(ErrorCode::AccessBlocked)
+        ));
         let quote = "Readable public content. é 👩‍🔬 ".repeat(20);
         let html = format!(
             "<article>{quote}</article><form><div data-sitekey='comment-form-widget'></div></form>"
@@ -1055,6 +1144,84 @@ mod tests {
                 .pages[0]
                 .contains(&quote)
         );
+    }
+
+    #[test]
+    fn streamed_html_content_is_recovered_without_executing_scripts() {
+        let html = r#"<html><head><title>Catalog</title></head><body>
+          <nav>Navigation<svg><title>Icon title</title></svg></nav><main><template id="B:0"></template>Loading</main>
+          <div hidden id="S:0"><template id="B:1"></template></div>
+          <div hidden id="S:1"><h2>Model é 👩‍🔬</h2><a href="/model">Details</a></div>
+          <div hidden id="S:2">Unreferenced hidden text</div>
+          <div hidden>Private hidden text</div>
+          <script>$RC("B:0","S:0");$RC("B:1","S:1")</script>
+          <script>throw new Error('do not execute')</script></body></html>"#;
+        let parsed = parse_html(
+            html.as_bytes(),
+            &PublicUrl::parse("https://example.com/").unwrap(),
+            "text/html",
+        )
+        .unwrap();
+        assert!(parsed.pages[0].contains("Model é 👩‍🔬"));
+        assert!(
+            parsed
+                .links
+                .iter()
+                .any(|link| link.url == "https://example.com/model")
+        );
+        assert!(!parsed.pages[0].contains("hidden text"));
+        assert!(!parsed.pages[0].contains("do not execute"));
+        assert_eq!(parsed.title, "Catalog");
+    }
+
+    #[test]
+    fn large_streamed_content_still_requires_observing_the_client_view() {
+        let html = format!(
+            "<main><template id='B:0'></template></main><div hidden id='S:0'><p>{}</p></div><script>$RC('B:0','S:0')</script>",
+            "Unfiltered card é 👩‍🔬 ".repeat(40)
+        );
+        let parsed = parse_html(
+            html.as_bytes(),
+            &PublicUrl::parse("https://example.com/").unwrap(),
+            "text/html",
+        )
+        .unwrap();
+        assert!(parsed.pages[0].contains("Unfiltered card é 👩‍🔬"));
+        assert!(
+            parsed
+                .warnings
+                .contains(&ExtractionWarning::JavascriptRequired)
+        );
+        assert!(!parsed.warnings.contains(&ExtractionWarning::PageShell));
+    }
+
+    #[test]
+    fn shell_detection_ignores_long_navigation_and_footer() {
+        let html = format!(
+            "<body><nav>{}</nav><main id='root'></main><footer>{}</footer><script src='/app.js'></script></body>",
+            "Navigation ".repeat(50),
+            "Footer ".repeat(50)
+        );
+        let parsed = parse_html(
+            html.as_bytes(),
+            &PublicUrl::parse("https://example.com/").unwrap(),
+            "text/html",
+        )
+        .unwrap();
+        assert!(parsed.warnings.contains(&ExtractionWarning::PageShell));
+        assert!(
+            parsed
+                .warnings
+                .contains(&ExtractionWarning::JavascriptRequired)
+        );
+    }
+
+    #[test]
+    fn tables_keep_all_cell_text_and_unicode() {
+        let parsed = parse_html("<table><tr><th>Name</th><th>Cost</th></tr><tr><td>Model é 👩‍🔬</td><td>$0.10</td></tr></table>".as_bytes(), &PublicUrl::parse("https://example.com/").unwrap(), "text/html").unwrap();
+        for text in ["Name", "Cost", "Model é 👩‍🔬", "$0.10"] {
+            assert!(parsed.pages[0].contains(text));
+        }
     }
 
     #[test]

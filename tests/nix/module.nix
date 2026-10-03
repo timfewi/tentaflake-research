@@ -75,6 +75,7 @@ let
   control = valid.systemd.services.agent-research-egress-control.serviceConfig;
   journal = valid.environment.etc."systemd/journald@secure-research.conf".text;
   granted = evaluate {
+    searchOrder = [ "brave" ];
     providers.brave = {
       enable = true;
       capabilities = [ "search" ];
@@ -324,6 +325,10 @@ let
     testSelfAuthoredProof = {
       expr = rejected { observationFile = "/run/agent-research-egress/control/state.json"; };
       expected = true;
+    };
+    testDefaultHasNoSearchProvider = {
+      expr = valid.services.secureResearch.searchOrder;
+      expected = [ ];
     };
     testProviderWithoutGrants = {
       expr = rejected { providers.brave.enable = true; };

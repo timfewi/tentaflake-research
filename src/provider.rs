@@ -59,54 +59,9 @@ async fn wait_for_throttle(
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct SearchQuery {
-    pub q: String,
-    #[serde(default = "default_count")]
-    pub count: u8,
-    pub language: Option<String>,
-    pub country: Option<String>,
-    pub freshness: Option<Freshness>,
-}
-
-fn default_count() -> u8 {
-    10
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
-pub enum Freshness {
-    #[serde(rename = "pd")]
-    Day,
-    #[serde(rename = "pw")]
-    Week,
-    #[serde(rename = "pm")]
-    Month,
-    #[serde(rename = "py")]
-    Year,
-}
+pub use crate::api::{Freshness, SearchQuery};
 
 impl SearchQuery {
-    pub fn validate(&self) -> Result<()> {
-        if self.q.trim().is_empty()
-            || self.q.chars().count() > 600
-            || self.q.split_whitespace().count() > 75
-            || self.q.contains('\0')
-            || !(1..=20).contains(&self.count)
-            || self.language.as_ref().is_some_and(|v| {
-                !(2..=8).contains(&v.len())
-                    || !v.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
-            })
-            || self
-                .country
-                .as_ref()
-                .is_some_and(|v| v.len() != 2 || !v.bytes().all(|b| b.is_ascii_uppercase()))
-        {
-            return Err(ErrorCode::InvalidRequest);
-        }
-        Ok(())
-    }
-
     pub fn url(&self) -> Result<PublicUrl> {
         self.validate()?;
         let mut url = url::Url::parse(BRAVE_ENDPOINT).map_err(|_| ErrorCode::InvalidRequest)?;

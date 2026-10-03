@@ -15,6 +15,14 @@ summarization only `summarize_order`; the orders are pairwise disjoint. No
 environment-variable key discovery or personal model login is involved, and no
 retrieval operation depends on an LLM.
 
+No commercial adapter is selected by default: `search_order`, `scrape_order` and
+`summarize_order` are empty. The NixOS module selects `searxng` only when its local
+SearXNG service is explicitly enabled. Existing Brave deployments must now set
+`searchOrder = [ "brave" ];` (or JSON `search_order: ["brave"]`) in addition to
+their grants. Inspect effective routes with `research_job` operation `providers`.
+HTTP retrieval remains available with every provider disabled, subject to egress
+readiness and the usual policy/budgets.
+
 Fallback uses only explicitly granted providers. Each attempt tracks its
 transport requests: a fixed-price successful response or a documented unbilled
 error may allow fallback for eligible provider errors; an uncertain paid error

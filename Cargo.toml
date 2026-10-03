@@ -8,10 +8,64 @@ description = "Bounded public research through an isolated, VPN-protected servic
 license = "MIT"
 
 [features]
-isolation-tests = []
-activation-tests = []
-browser-tests = []
-nixos-tests = []
+default = ["service"]
+service = [
+    "dep:async-trait", "dep:async-tungstenite", "dep:bytes", "dep:chrono",
+    "dep:chromiumoxide", "dep:chromiumoxide_types", "dep:dom_smoothie",
+    "dep:dom_query", "dep:encoding_rs", "dep:futures-util", "dep:hickory-resolver",
+    "dep:http", "dep:httparse", "dep:listenfd", "dep:nix", "dep:reqwest",
+    "dep:rusqlite", "dep:rustix", "dep:rustls", "dep:tempfile", "dep:webpki-roots",
+    "schemars/chrono04", "tokio/rt-multi-thread", "tokio/process", "tokio/signal",
+]
+isolation-tests = ["service"]
+activation-tests = ["service"]
+browser-tests = ["service"]
+nixos-tests = ["service"]
+
+[[bin]]
+name = "research-service"
+path = "src/bin/research-service.rs"
+required-features = ["service"]
+
+[[bin]]
+name = "research-egress"
+path = "src/bin/research-egress.rs"
+required-features = ["service"]
+
+[[bin]]
+name = "research-egress-control"
+path = "src/bin/research-egress-control.rs"
+required-features = ["service"]
+
+[[bin]]
+name = "research-vpn-observer"
+path = "src/bin/research-vpn-observer.rs"
+required-features = ["service"]
+
+[[bin]]
+name = "research-worker"
+path = "src/bin/research-worker.rs"
+required-features = ["service"]
+
+[[bin]]
+name = "research-browser-worker"
+path = "src/bin/research-browser-worker.rs"
+required-features = ["service"]
+
+[[bin]]
+name = "research-searxng"
+path = "src/bin/research-searxng.rs"
+required-features = ["service"]
+
+[[test]]
+name = "service_rpc"
+path = "tests/service_rpc.rs"
+required-features = ["service"]
+
+[[test]]
+name = "searxng_pipeline"
+path = "tests/searxng_pipeline.rs"
+required-features = ["service"]
 
 [[test]]
 name = "nixos-config"
@@ -69,40 +123,44 @@ required-features = ["activation-tests"]
 
 [dependencies]
 anyhow = "1"
-async-trait = "0.1"
-async-tungstenite = { version = "0.32", default-features = false, features = ["tokio-runtime"] }
+async-trait = { version = "0.1", optional = true }
+async-tungstenite = { version = "0.32", default-features = false, features = ["tokio-runtime"], optional = true }
 base64 = "0.22"
-bytes = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-chromiumoxide = { version = "=0.9.1", default-features = false }
-chromiumoxide_types = "=0.9.1"
+bytes = { version = "1", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"], optional = true }
+chromiumoxide = { version = "=0.9.1", default-features = false, optional = true }
+chromiumoxide_types = { version = "=0.9.1", optional = true }
 clap = { version = "4", features = ["derive"] }
-dom_smoothie = "=0.18.0"
-dom_query = "=0.28.0"
-encoding_rs = "0.8"
-futures-util = "0.3"
-hickory-resolver = { version = "0.26.1", default-features = false, features = ["tokio"] }
-http = "1"
-httparse = "1"
+dom_smoothie = { version = "=0.18.0", optional = true }
+dom_query = { version = "=0.28.0", optional = true }
+encoding_rs = { version = "0.8", optional = true }
+futures-util = { version = "0.3", optional = true }
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["tokio"], optional = true }
+http = { version = "1", optional = true }
+httparse = { version = "1", optional = true }
 ipnet = { version = "2", features = ["serde"] }
-listenfd = "1"
-nix = { version = "0.30", default-features = false, features = ["net"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "stream", "json", "query", "gzip", "brotli", "deflate", "zstd"] }
+listenfd = { version = "1", optional = true }
+nix = { version = "0.30", default-features = false, features = ["net"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "stream", "json", "query", "gzip", "brotli", "deflate", "zstd"], optional = true }
 rmcp = { version = "=3.3.0", default-features = false, features = ["server", "macros", "schemars", "transport-io"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
-rustix = { version = "1", features = ["fs", "net", "process", "stdio", "thread"] }
-rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
-schemars = { version = "1", features = ["chrono04", "uuid1"] }
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
+rustix = { version = "1", features = ["fs", "net", "process", "stdio", "thread"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"], optional = true }
+schemars = { version = "1", features = ["uuid1"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
-tempfile = "3"
+tempfile = { version = "3", optional = true }
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "process", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "io-std", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["codec", "rt", "io"] }
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-webpki-roots = "1"
+webpki-roots = { version = "1", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["process"] }
 
 [lints.rust]
 unsafe_code = "forbid"

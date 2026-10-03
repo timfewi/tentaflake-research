@@ -1,6 +1,11 @@
 # Agent instructions — tentaflake-research
 
 - Keep credentials, personal data and runtime state outside Git.
+- Keep the five-tool Research contract provider-independent. Provider adapters
+  are explicitly granted optional service integrations; domain-specific lead or
+  contact workflows do not belong in the shared infrastructure interface.
+- Keep the standalone client free of service/browser/provider dependencies and
+  preserve the reconnect/no-replay contract when changing its shared code.
 - Preserve existing user changes. Write documentation and CLI text in English.
 - Read README.md, SECURITY.md and docs/development.md before changing boundaries.
 - Keep Cargo artifacts outside `/tmp`, which can be small. Use the pinned shell.

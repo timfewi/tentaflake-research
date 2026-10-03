@@ -89,6 +89,8 @@ impl Transport for Upstream {
                 .into_bytes(),
             ),
             "/partial-html" => (200, b"<html><script>window.x = 1</script></html>".to_vec()),
+            "/page-shell" => (200, format!("<body><nav>{}</nav><main></main><footer>{}</footer><script src='/app.js'></script></body>", "Navigation ".repeat(50), "Footer ".repeat(50)).into_bytes()),
+            "/streamed-catalog" => (200, "<body><main><template id='B:0'></template></main><div hidden id='S:0'><h2>Model é 👩‍🔬</h2><a href='/model'>Details</a></div><script>$RC('B:0','S:0')</script></body>".as_bytes().to_vec()),
             "/binary" => (200, vec![0, 255, 42, 10]),
             "/large" => (200, vec![b'x'; 2 * 1024 * 1024]),
             "/partial-content" => (206, b"prefix".to_vec()),
@@ -152,7 +154,10 @@ impl Transport for Upstream {
         let mut headers = HeaderMap::new();
         headers.insert(
             "content-type",
-            if path == "/links" || path == "/partial-html" {
+            if matches!(
+                path.as_str(),
+                "/links" | "/partial-html" | "/page-shell" | "/streamed-catalog"
+            ) {
                 "text/html; charset=utf-8"
             } else if path == "/binary" {
                 "application/octet-stream"
@@ -323,6 +328,7 @@ impl Fixture {
             egress_uid: Some(1002),
             allowed_client_uids: vec![owner, owner + 1],
             providers: [("brave".into(), provider.clone())].into(),
+            search_order: vec!["brave".into()],
             limits,
             ..Default::default()
         };
@@ -2462,6 +2468,7 @@ async fn spider_provider_fetch_archives_the_array_envelope_and_markdown() {
 struct CrawlUpstream {
     ledger: Arc<Ledger>,
     robots: (u16, String),
+    robots_headers: Mutex<HeaderMap>,
     /// path -> (status, body, content-type)
     pages: HashMap<String, (u16, String, String)>,
     suspend: Option<String>,
@@ -2521,6 +2528,15 @@ impl Transport for CrawlUpstream {
         charge.finish(body.len() as u64, Some(0))?;
         let mut headers = HeaderMap::new();
         headers.insert("content-type", content_type.parse().unwrap());
+        if path == "/robots.txt" {
+            headers.extend(self.robots_headers.lock().unwrap().clone());
+        }
+        if (300..400).contains(&status) {
+            headers.insert(
+                "location",
+                std::str::from_utf8(&body).unwrap().parse().unwrap(),
+            );
+        }
         Ok(HttpResponse {
             status,
             body,
@@ -2564,6 +2580,7 @@ async fn crawl_fixture(
     let upstream = Arc::new(CrawlUpstream {
         ledger: ledger.clone(),
         robots: (robots.0, robots.1.to_owned()),
+        robots_headers: Mutex::new(HeaderMap::new()),
         pages: pages
             .iter()
             .map(|(path, status, body, media)| {
@@ -3526,4 +3543,158 @@ async fn summary_is_unavailable_without_a_grant_or_under_strict_privacy() {
             .unwrap();
         assert_eq!(original["content"], "Exact é 👩‍🔬 quote.\nSecond line.");
     }
+}
+
+#[tokio::test]
+async fn regression_successful_http_shell_and_streamed_payload_have_honest_coverage_and_readable_evidence()
+ {
+    let fixture = Fixture::new(Privacy::Practical, false).await;
+    let (bridge, serving) = fixture.connect().await;
+    let id = job(&bridge).await;
+    let result = call(&bridge, Tool::ResearchFetch, json!({"job_id":id,"urls":["https://example.com/page-shell","https://example.com/streamed-catalog"],"mode":"http"})).await;
+    assert_eq!(result["coverage"]["success"], 0, "{result}");
+    assert_eq!(result["coverage"]["partial"], 2, "{result}");
+    let shell = &result["items"][0]["data"];
+    assert_eq!(shell["javascript_required"], true);
+    assert!(
+        shell["source"]["warnings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("page_shell"))
+    );
+    let streamed = &result["items"][1]["data"];
+    assert!(
+        streamed["source"]["warnings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("streaming_html_recovered"))
+    );
+    let source = &streamed["source"];
+    let text = call(&bridge, Tool::ResearchRead, json!({"kind":"source","source_id":source["id"],"representation_id":source["primary_representation"]["id"]})).await;
+    assert!(text["content"].as_str().unwrap().contains("Model é 👩‍🔬"));
+    let raw = call(
+        &bridge,
+        Tool::ResearchRead,
+        json!({"kind":"metadata","source_id":streamed["raw_source_id"]}),
+    )
+    .await;
+    assert_eq!(raw["representations"][0]["kind"], "http_entity");
+    assert_ne!(raw["id"], source["id"]);
+    bridge.close().await;
+    serving.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn regression_crawl_redirect_destination_is_not_fetched_twice_with_uncacheable_robots() {
+    let fixture = crawl_fixture(Privacy::Practical, Limits::default(), (200, "User-agent: *\nAllow: /\n"), &[
+        ("/seed", 302, "/introduction", "text/plain"),
+        ("/introduction", 200, "<a href='/introduction'>self</a><a href='/cookbooks'>Cookbooks</a><a href='/models'>Models</a><a href='/quickstart'>Quickstart</a>", "text/html"),
+        ("/cookbooks", 200, "Cookbooks", "text/plain"),
+        ("/models", 200, "Models", "text/plain"),
+        ("/quickstart", 200, "Quickstart", "text/plain"),
+    ], None).await;
+    fixture
+        .upstream
+        .robots_headers
+        .lock()
+        .unwrap()
+        .insert("cache-control", "no-store".parse().unwrap());
+    let id = fixture.job(json!({"requests":16})).await;
+    let result = fixture.fetch(id, json!({"pages":10,"depth":2})).await;
+    let crawl = &result["items"][0]["data"]["crawl"];
+    assert_eq!(crawl["failed"], 0, "{result}");
+    assert_eq!(crawl["fetched"], 3, "{result}");
+    assert_eq!(crawl["paused"], false);
+    let calls = fixture.upstream.calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|url| url.ends_with("/introduction"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|url| url.ends_with("/robots.txt"))
+            .count(),
+        9,
+        "{calls:?}"
+    );
+    assert_eq!(
+        fixture
+            .ledger
+            .get(fixture.owner, id)
+            .unwrap()
+            .usage
+            .requests,
+        14
+    );
+}
+
+#[tokio::test]
+async fn provider_inspection_is_authorized_offline_and_uses_no_job_capacity_or_network() {
+    let fixture = Fixture::with_limits(
+        Privacy::Practical,
+        false,
+        Limits {
+            active_jobs: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let (bridge, serving) = fixture.connect().await;
+    let id = job(&bridge).await;
+    let before = fixture.ledger.get(fixture.owner, id).unwrap().usage;
+    fixture
+        .service
+        .update_egress(EgressState::offline())
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let result = call(&bridge, Tool::ResearchJob, json!({"operation":"providers"})).await;
+        assert_eq!(result["capabilities"]["search"][0]["provider"], "brave");
+        assert_eq!(
+            result["capabilities"]["search"][0]["request_micro_usd"],
+            5000
+        );
+        assert!(result.get("job").is_none());
+        assert!(!result.to_string().contains("credential"));
+        assert!(!result.to_string().contains("fixture-key"));
+    }
+    assert!(fixture.upstream.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        serde_json::to_value(before).unwrap(),
+        serde_json::to_value(fixture.ledger.get(fixture.owner, id).unwrap().usage).unwrap()
+    );
+    assert_eq!(
+        fixture
+            .service
+            .call(
+                fixture.owner + 2,
+                Uuid::new_v4(),
+                Tool::ResearchJob,
+                json!({"operation":"providers"}),
+                CancellationToken::new()
+            )
+            .await
+            .unwrap_err(),
+        ErrorCode::PermissionDenied
+    );
+    bridge.close().await;
+    serving.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn provider_inspection_honors_strict_privacy_without_contacting_scrapers() {
+    let fixture = scrape_fixture("firecrawl", Privacy::Strict, "User-agent: *\nAllow: /\n").await;
+    let result = scrape_call(
+        &fixture,
+        Tool::ResearchJob,
+        json!({"operation":"providers"}),
+    )
+    .await;
+    assert_eq!(result["capabilities"]["scrape"], json!([]));
+    assert!(fixture.upstream.paths.lock().unwrap().is_empty());
+    assert_eq!(fixture.upstream.posts.load(Ordering::SeqCst), 0);
 }
