@@ -99,7 +99,12 @@ paid provider calls and host activation were not run for this follow-up. Existin
 VM evidence above remains historical. The standard fast gate's generic Semgrep
 baseline scanned no Rust files and is not Rust security evidence.
 
-Next step: review these local changes, publish only with maintainer authorization,
-then update the consuming Tentaflake Research pin and run the affected deployment
-fixtures. The template still pins its previously published Research revision;
-no lockfile, private runtime catalogue, host state or real credential was copied.
+Publication checkpoint: the DCO-signed source is pushed for review in
+[PR #3](https://github.com/timfewi/tentaflake-research/pull/3). The staged redacted
+Gitleaks scan passed. After upstream review/merge, the consuming input update and
+affected deployment fixtures are tracked in
+[Tentaflake issue #110](https://github.com/timfewi/tentaflake/issues/110).
+Provider-independent VPN adapter acceptance remains separate in
+[issue #4](https://github.com/timfewi/tentaflake-research/issues/4).
+The template still pins its previously published Research revision; no lockfile,
+private runtime catalogue, host state or real credential was copied.
