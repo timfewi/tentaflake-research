@@ -17,3 +17,10 @@ static streamed-HTML and page-shell handling, and redirect-aware crawl deduplica
 The public client's recovery rules, container relay boundary and five-tool
 interface remain authoritative. Contact enrichment, deployment configuration,
 runtime provider catalogues and private historical documentation were not imported.
+
+The 2026-10-05 follow-up selectively adapts the MIT-licensed snapshot
+`4c2030c`: formatted HTML text (`research-html/v3`), the constrained package
+source selection, typed job-limit and browser-denial failure details, and the
+short RPC fixture sockets. The five-tool interface, the public client's recovery
+rules and the exclusion of contact enrichment, runtime provider catalogues and
+private historical documentation remain unchanged.

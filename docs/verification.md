@@ -108,3 +108,31 @@ Provider-independent VPN adapter acceptance remains separate in
 [issue #4](https://github.com/timfewi/tentaflake-research/issues/4).
 The template still pins its previously published Research revision; no lockfile,
 private runtime catalogue, host state or real credential was copied.
+
+## Formatted text, package sources and failure details (2026-10-05)
+
+Source changes: HTML text uses normalized, block-separated formatted text
+(`research-html/v3`), the service package source admits only declared files
+(`nix/source.nix`), invalid job limits and browser denials return typed reasons
+over the existing v1 envelope, and RPC fixture sockets stay within the Unix
+address limit. The reconnect/no-replay bridge path is unchanged; the new
+`call_detailed` wraps it, and `call` keeps returning the plain error code.
+Client and service must be updated together to see detailed failures.
+
+Evidence for this source checkpoint (pinned shell, offline):
+
+- `cargo fmt`, `scripts/check client` (dependency guard, Clippy, client tests),
+  all-target/all-feature Clippy with warnings denied and the default-feature
+  tests passed, including the MCP invalid-limit regression, the short-socket
+  regression and the existing reconnect/ownership tests. `deadnix`, `statix`,
+  `nixfmt`, `shellcheck`, `tests/source-inputs.sh` and the client package
+  evaluation passed. A negative control (hidden paths no longer skipped) made the
+  source-input test fail.
+- `scripts/check browser-isolation` and `scripts/check worker-isolation`:
+  passed with the pinned Bubblewrap, Chromium, fontconfig and parser closures.
+  The browser service fixture covers the robots denial reason and the retained
+  `render_error_details`.
+
+Not run: package builds, VM suites, live provider or browser requests against
+real sites, and host activation. The new text format was verified on synthetic
+HTML only.
