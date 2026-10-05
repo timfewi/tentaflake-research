@@ -292,6 +292,7 @@ async fn bounded_link_preview_retains_complete_labels_in_a_saved_representation(
 }
 struct Fixture {
     _root: tempfile::TempDir,
+    _sockets: tempfile::TempDir,
     service: Arc<Service>,
     upstream: Arc<Upstream>,
     ledger: Arc<Ledger>,
@@ -311,6 +312,20 @@ impl Fixture {
     }
     async fn with_limits(privacy: Privacy, rights: bool, limits: Limits) -> Self {
         let root = tempfile::tempdir().unwrap();
+        Self::with_root(privacy, rights, limits, root).await
+    }
+    async fn with_root(
+        privacy: Privacy,
+        rights: bool,
+        limits: Limits,
+        root: tempfile::TempDir,
+    ) -> Self {
+        // Socket addresses have a fixed byte limit. Keep only the socket nodes
+        // in a short private directory; evidence still follows the caller's TMPDIR.
+        let sockets = tempfile::Builder::new()
+            .prefix("research-rpc-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let owner = rustix::process::getuid().as_raw();
         let provider = ProviderConfig {
             endpoint: None,
@@ -364,6 +379,7 @@ impl Fixture {
         service.update_egress(ready()).await.unwrap();
         Self {
             _root: root,
+            _sockets: sockets,
             service,
             upstream,
             ledger,
@@ -371,7 +387,7 @@ impl Fixture {
         }
     }
     async fn connect(&self) -> (Arc<Bridge>, tokio::task::JoinHandle<Result<()>>) {
-        let socket = self._root.path().join(Uuid::new_v4().to_string());
+        let socket = self._sockets.path().join(Uuid::new_v4().to_string());
         let listener = UnixListener::bind(&socket).unwrap();
         let service = self.service.clone();
         let serving = tokio::spawn(async move {
@@ -389,7 +405,7 @@ impl Fixture {
         &self,
         name: &str,
     ) -> (std::path::PathBuf, tokio::task::JoinHandle<Result<()>>) {
-        let socket = self._root.path().join(name);
+        let socket = self._sockets.path().join(name);
         let listener = UnixListener::bind(&socket).unwrap();
         let service = self.service.clone();
         let serving = tokio::spawn(async move {
@@ -438,6 +454,34 @@ async fn job(bridge: &Bridge) -> Uuid {
         call(bridge, Tool::ResearchJob, json!({"operation":"start"})).await["job"]["id"].clone(),
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn rpc_sockets_support_storage_paths_beyond_the_unix_address_limit() {
+    let base = tempfile::tempdir().unwrap();
+    let parent = base.path().join("long-storage-path-".repeat(8));
+    std::fs::create_dir_all(&parent).unwrap();
+    let root = tempfile::tempdir_in(&parent).unwrap();
+    let fixture = Fixture::with_root(
+        Privacy::Practical,
+        false,
+        Limits {
+            retries: 0,
+            ..Default::default()
+        },
+        root,
+    )
+    .await;
+    assert!(fixture._root.path().starts_with(&parent));
+    assert!(fixture._root.path().join("state/budget.sqlite").is_file());
+    assert!(
+        std::os::unix::net::SocketAddr::from_pathname(fixture._root.path().join("storage.sock"))
+            .is_err()
+    );
+    let (bridge, serving) = fixture.connect().await;
+    assert_ne!(job(&bridge).await, Uuid::nil());
+    bridge.close().await;
+    serving.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -1330,7 +1374,7 @@ async fn job_remains_usable_across_multiple_healthy_observer_refreshes() {
 #[tokio::test]
 async fn incompatible_version_gets_explicit_error_and_closes_connection() {
     let fixture = Fixture::new(Privacy::Practical, false).await;
-    let socket = fixture._root.path().join("version.sock");
+    let socket = fixture._sockets.path().join("version.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let service = fixture.service.clone();
     let serving = tokio::spawn(async move {
@@ -1375,7 +1419,7 @@ async fn incompatible_version_gets_explicit_error_and_closes_connection() {
 async fn actual_mcp_binary_lists_five_tools_and_keeps_stdout_protocol_only() {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     let fixture = Fixture::new(Privacy::Practical, false).await;
-    let socket = fixture._root.path().join("mcp.sock");
+    let socket = fixture._sockets.path().join("mcp.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let service = fixture.service.clone();
     let serving = tokio::spawn(async move {
@@ -1555,7 +1599,7 @@ async fn mcp_client(socket: &std::path::Path, messages: &[Value]) -> Vec<Value> 
 async fn mcp_messages(fixture: &Fixture, messages: &[Value]) -> Vec<Value> {
     // The fixture owns a private temporary directory, so a fixed short name
     // stays unique per call while keeping the path under the Unix socket limit.
-    let socket = fixture._root.path().join("mcp.sock");
+    let socket = fixture._sockets.path().join("mcp.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let service = fixture.service.clone();
     let serving = tokio::spawn(async move {
