@@ -136,3 +136,14 @@ Evidence for this source checkpoint (pinned shell, offline):
 Not run: package builds, VM suites, live provider or browser requests against
 real sites, and host activation. The new text format was verified on synthetic
 HTML only.
+
+## research-curl diagnostics (2026-10-05)
+
+`research-curl` answers `--help` and `--version` locally and replaces clap's
+generic unknown-option error, whose tip suggested passing a rejected curl option
+after `--` as the URL, with a message that names only the option, states the
+GET-only contract and shows a stdout redirect. Option values and extra URLs are
+never echoed. Evidence: the client gate (`scripts/check client`) passed, including
+unit tests for the diagnostic and end-to-end client-transport tests that run the
+binary against a listener asserting that no connection is made. Not run: package
+builds, the host `curl` wrapper and live requests.

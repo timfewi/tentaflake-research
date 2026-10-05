@@ -61,6 +61,20 @@ This server exposes five operations: `research_job`, `research_search`,
 policy boundary. See [the API](docs/api.md). The client package also provides
 GET-only `research-curl`, which uses the same socket and policy.
 
+`research-curl` is a restricted curl replacement, not full curl. It accepts
+`-f`, `-s`, `-S`, `-L`, `-m`/`--max-time` and `--socket`, writes the body to
+stdout (`research-curl -fsSL --max-time 25 URL > page.html`) and answers `--help`
+and `--version` locally. An unsupported option such as `-D` or `-o` exits with
+status 2 and a message that names only the option and states this contract.
+Response headers are not retained; `research_fetch` and `research_read` report a
+source's final URL and retrieval time. None of these paths opens the socket or
+starts a job. A host that exposes it as `curl` should execute it unchanged: its
+`--version` starts with `research-curl <version>`, and the wrapper must not
+translate, drop or retry unsupported options, add headers or credentials, or fall
+back to a direct network client. Agent guidance should prefer the exposed Research
+MCP tools, read `curl --help` after an argument error and not treat deployment
+logs as proof of a live-site check.
+
 `research-client` is an independent, small package: it builds without service,
 browser, HTTP/TLS, DNS, HTML-parser or SQLite dependencies. Both client binaries
 retain the same five-tool protocol and Unix-socket transport. The service and
