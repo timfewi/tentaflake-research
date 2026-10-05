@@ -62,6 +62,15 @@ Browser/parser process fixtures in `scripts/check` require the pinned executable
 paths and an exact closure file. See [browser-validation.md](browser-validation.md).
 Missing isolation prerequisites fail the fixture; do not disable isolation.
 
+The service package source (`nix/source.nix`) admits only regular `.rs` files
+under `src` and `tests`, `Cargo.toml`, `Cargo.lock` and the embedded
+`src/browser/read.js`. It excludes `tests/nix`, hidden paths, build/cache/result
+directories, symlinks and special files, so local state such as credentials or
+caches under `src` never enters the Nix store, and it rejects required inputs
+supplied through symlinks. Declare any new non-Rust package input in
+`nix/source.nix`. `tests/source-inputs.sh` checks this with synthetic files and
+runs in `project-check fast`. The client package keeps its explicit file list.
+
 Keep documentation-only files outside the Rust package fileset. Before publication,
 review the selected Git diff, run a redacted secret scan and verify documentation
 links. Record exactly which source checkpoint and fixture were tested in

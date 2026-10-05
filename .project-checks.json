@@ -2,6 +2,24 @@
   "version": 1,
   "checks": [
     {
+      "name": "source-inputs",
+      "argv": [
+        "bash",
+        "tests/source-inputs.sh"
+      ],
+      "requires": [
+        "bash",
+        "nix",
+        "mktemp",
+        "timeout",
+        "mkfifo"
+      ],
+      "timeout_seconds": 120,
+      "profiles": [
+        "fast"
+      ]
+    },
+    {
       "name": "client-package-evaluation",
       "argv": [
         "nix", "eval", "--raw", "--no-write-lock-file",

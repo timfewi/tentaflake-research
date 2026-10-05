@@ -15,37 +15,28 @@ pkgs.rustPlatform.buildRustPackage (
   {
     pname = "secure-research";
     version = "0.1.0";
-    src = pkgs.lib.fileset.toSource {
-      root = ../.;
-      fileset = lib.fileset.unions (
-        [
-          ../Cargo.toml
-          ../Cargo.lock
-        ]
-        ++ (
-          if clientOnly then
-            [
-              ../src/api.rs
-              ../src/bridge.rs
-              ../src/config.rs
-              ../src/error.rs
-              ../src/lib.rs
-              ../src/mcp.rs
-              ../src/policy.rs
-              ../src/protocol.rs
-              ../src/bin/research-client.rs
-              ../src/bin/research-curl.rs
-              ../tests/client_transport.rs
-            ]
-          else
-            [
-              ../src
-              # Deployment fixture edits do not change the Rust package inputs.
-              (lib.fileset.difference ../tests ../tests/nix)
-            ]
-        )
-      );
-    };
+    src =
+      if clientOnly then
+        lib.fileset.toSource {
+          root = ../.;
+          fileset = lib.fileset.unions [
+            ../Cargo.toml
+            ../Cargo.lock
+            ../src/api.rs
+            ../src/bridge.rs
+            ../src/config.rs
+            ../src/error.rs
+            ../src/lib.rs
+            ../src/mcp.rs
+            ../src/policy.rs
+            ../src/protocol.rs
+            ../src/bin/research-client.rs
+            ../src/bin/research-curl.rs
+            ../tests/client_transport.rs
+          ];
+        }
+      else
+        import ./source.nix { inherit lib; };
     cargoLock.lockFile = ../Cargo.lock;
     outputs = [
       "out"
