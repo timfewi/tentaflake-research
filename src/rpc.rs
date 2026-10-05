@@ -165,8 +165,18 @@ pub async fn connection(
                             let output = output.clone();
                             let connection_stop = stop.clone();
                             calls.spawn(async move {
-                                let outcome = match service.call(owner, connection_id, tool, arguments, request_stop).await {
-                                    Ok(value) => Outcome::Result { value }, Err(code) => Outcome::Error { code },
+                                let outcome = match service.call(owner, connection_id, tool, arguments.clone(), request_stop).await {
+                                    Ok(value) => Outcome::Result { value },
+                                    Err(code) => {
+                                        let failure = service.failure(tool, &arguments, code);
+                                        // Detailed failures fit the existing v1 JSON result
+                                        // envelope; the MCP adapter marks them as errors.
+                                        if failure.details.is_some() {
+                                            Outcome::Result { value: json!(failure) }
+                                        } else {
+                                            Outcome::Error { code: failure.code }
+                                        }
+                                    },
                                 };
                                 tokio::select! { _ = connection_stop.cancelled() => (), _ = output.send(Response { version: VERSION, id: request.id, outcome }) => () }
                                 request.id

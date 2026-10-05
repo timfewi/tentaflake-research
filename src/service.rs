@@ -205,6 +205,27 @@ pub struct Dependencies {
 }
 
 impl Service {
+    /// Called by the authenticated RPC layer after a failure. Only typed input
+    /// limits and fixed service-authored reason codes enter this diagnostic.
+    pub fn failure(
+        &self,
+        tool: Tool,
+        arguments: &Value,
+        code: ErrorCode,
+    ) -> crate::error::ToolFailure {
+        let mut failure = crate::error::ToolFailure::from(code);
+        if code == ErrorCode::InvalidRequest
+            && tool == Tool::ResearchJob
+            && let Ok(JobArgs::Start { limits }) = parse(arguments.clone())
+        {
+            let violations = limits.violations(&self.config.limits);
+            if !violations.is_empty() {
+                failure.details = Some(crate::error::ErrorDetails::JobLimits { violations });
+            }
+        }
+        failure
+    }
+
     pub fn new(config: Config, dependencies: Dependencies) -> Result<Arc<Self>> {
         config.validate()?;
         let Dependencies {
@@ -932,7 +953,9 @@ impl Service {
         {
             let mut rendered =
                 browser_item(index, self.render_fetch(context, &target, slots).await);
-            if let Some(data) = rendered.data.as_mut() {
+            if !matches!(rendered.state, ItemState::Failed)
+                && let Some(data) = rendered.data.as_mut()
+            {
                 data["http"] = item.data.take().expect("HTTP evidence was assembled above");
                 rendered
             } else {
@@ -940,6 +963,13 @@ impl Service {
                 item.error = rendered.error;
                 if let Some(data) = item.data.as_mut() {
                     data["render_error"] = json!(rendered.error);
+                    if let Some(details) = rendered
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("error_details"))
+                    {
+                        data["render_error_details"] = details.clone();
+                    }
                 }
                 item
             }
@@ -1716,7 +1746,14 @@ fn crawl_page_data(depth: u32, record: &FetchRecord) -> Value {
 fn browser_item(index: usize, result: Result<Value>) -> Item {
     let mut data = match result {
         Ok(data) => data,
-        Err(error) => return Item::failed(index, error),
+        Err(error) => {
+            let failure = crate::error::ToolFailure::from(error);
+            let mut item = Item::failed(index, failure.code);
+            if let Some(details) = failure.details {
+                item.data = Some(json!({"error_details": details}));
+            }
+            return item;
+        }
     };
     let error = match serde_json::from_value::<Option<ErrorCode>>(data["error"].clone()) {
         Ok(error) => error,

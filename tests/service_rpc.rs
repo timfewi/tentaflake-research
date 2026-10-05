@@ -1676,6 +1676,44 @@ async fn mcp_discover_advertises_the_2026_07_28_revision_without_a_handshake() {
 }
 
 #[tokio::test]
+async fn mcp_invalid_job_limits_identify_every_field_without_creating_a_job() {
+    let requests = [
+        json!({"queries":5,"requests":16,"documents":16,"bytes":2500000,"seconds":600,"micro_usd":150000}),
+        json!({"queries":2,"requests":20,"documents":20,"seconds":500}),
+        json!({"seconds":0,"requests":513,"micro_usd":500001}),
+    ];
+    for (index, limits) in requests.into_iter().enumerate() {
+        let fixture = Fixture::new(Privacy::Practical, false).await;
+        let replies = mcp_messages(&fixture, &[
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"research_job","arguments":{"operation":"start","limits":limits},"_meta":stateless_meta()}})
+        ]).await;
+        let result = &replies[0]["result"];
+        assert_eq!(result["isError"], true, "{result}");
+        let failure = &result["structuredContent"];
+        assert_eq!(failure["error"], "invalid_request");
+        assert_eq!(failure["details"]["reason"], "job_limits");
+        let seconds = [600, 500, 0][index];
+        let mut expected =
+            vec![json!({"field":"seconds","requested":seconds,"minimum":1,"maximum":300})];
+        if index == 2 {
+            expected.extend([
+                json!({"field":"micro_usd","requested":500001,"minimum":0,"maximum":500000}),
+                json!({"field":"requests","requested":513,"minimum":0,"maximum":512}),
+            ]);
+        }
+        assert_eq!(failure["details"]["violations"], json!(expected));
+        let database =
+            rusqlite::Connection::open(fixture._root.path().join("state/budget.sqlite")).unwrap();
+        assert_eq!(
+            database
+                .query_row("SELECT count(*) FROM jobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[tokio::test]
 async fn mcp_inline_tools_call_is_stateless_and_reports_a_complete_result() {
     let fixture = Fixture::new(Privacy::Practical, false).await;
     let replies = mcp_messages(

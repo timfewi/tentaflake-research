@@ -470,7 +470,7 @@ impl Worker {
         let checked =
             request::from_cdp(&paused.request, paused.resource_type.as_ref(), main, depth)
                 .and_then(|request| {
-                    request::check(&request, &self.settings.read_post_rules)?;
+                    request::check_diagnosed(&request, &self.settings.read_post_rules)?;
                     Ok(request)
                 });
         let checked = if depth > self.settings.redirects {

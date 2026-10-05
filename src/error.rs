@@ -18,6 +18,12 @@ pub enum ErrorCode {
     DestinationDenied,
     #[error("policy does not allow this operation")]
     PolicyDenied,
+    #[error("browser identity does not match the pinned Chromium identity")]
+    BrowserIdentityMismatch,
+    #[error("browser request is outside the reviewed method/header/operation grant")]
+    BrowserRequestDenied,
+    #[error("robots policy denies the browser destination")]
+    BrowserRobotsDenied,
     #[error("provider is not configured for this capability")]
     ProviderUnavailable,
     #[error("provider authentication failed")]
@@ -63,3 +69,64 @@ pub enum ErrorCode {
 }
 
 pub type Result<T> = std::result::Result<T, ErrorCode>;
+
+/// Diagnostic values are fixed enums and validated numeric limits, never
+/// upstream text, headers, URLs, credentials or filesystem paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolFailure {
+    #[serde(rename = "error")]
+    pub code: ErrorCode,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub details: Option<ErrorDetails>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ErrorDetails {
+    JobLimits { violations: Vec<LimitViolation> },
+    BrowserIdentityMismatch,
+    BrowserRequestNotGranted,
+    RobotsDisallowed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitField {
+    Seconds,
+    Bytes,
+    MicroUsd,
+    Queries,
+    Documents,
+    Requests,
+    PdfPages,
+    BrowserActions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitViolation {
+    pub field: LimitField,
+    pub requested: u64,
+    pub minimum: u64,
+    pub maximum: u64,
+}
+
+impl From<ErrorCode> for ToolFailure {
+    fn from(code: ErrorCode) -> Self {
+        let details = match code {
+            ErrorCode::BrowserIdentityMismatch => Some(ErrorDetails::BrowserIdentityMismatch),
+            ErrorCode::BrowserRequestDenied => Some(ErrorDetails::BrowserRequestNotGranted),
+            ErrorCode::BrowserRobotsDenied => Some(ErrorDetails::RobotsDisallowed),
+            _ => None,
+        };
+        Self {
+            code: if details.is_some() {
+                ErrorCode::PolicyDenied
+            } else {
+                code
+            },
+            details,
+        }
+    }
+}

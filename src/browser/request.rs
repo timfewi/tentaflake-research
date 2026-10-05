@@ -167,6 +167,30 @@ pub fn check(request: &wire::HttpRequest, rules: &[ReadPostRule]) -> Result<Chec
     })
 }
 
+/// Preserve the gate while distinguishing its safe failure reasons at the
+/// worker/service boundary. Header values themselves never enter diagnostics.
+pub fn check_diagnosed(
+    request: &wire::HttpRequest,
+    rules: &[ReadPostRule],
+) -> Result<CheckedRequest> {
+    check(request, rules).map_err(|error| {
+        if error != ErrorCode::PolicyDenied {
+            return error;
+        }
+        let browser_agent =
+            crate::config::DEFAULT_USER_AGENT.replacen("Chrome/", "HeadlessChrome/", 1);
+        if request
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("user-agent") && value != &browser_agent)
+        {
+            ErrorCode::BrowserIdentityMismatch
+        } else {
+            ErrorCode::BrowserRequestDenied
+        }
+    })
+}
+
 pub fn from_cdp(
     request: &network::Request,
     resource_type: &str,
@@ -229,6 +253,27 @@ pub fn from_cdp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnosed_gate_keeps_denials_and_never_echoes_header_values() {
+        let mut request = post(b"");
+        request.method = "GET".into();
+        request.headers = vec![("User-Agent".into(), "untrusted-secret-value".into())];
+        let error = check_diagnosed(&request, &[]).err().unwrap();
+        assert_eq!(error, ErrorCode::BrowserIdentityMismatch);
+        let failure = crate::error::ToolFailure::from(error);
+        assert_eq!(failure.code, ErrorCode::PolicyDenied);
+        let json = serde_json::to_string(&failure).unwrap();
+        assert!(json.contains("browser_identity_mismatch"));
+        assert!(!json.contains("untrusted-secret-value"));
+        request.headers = vec![("Authorization".into(), "untrusted-secret-value".into())];
+        assert!(matches!(
+            check_diagnosed(&request, &[]),
+            Err(ErrorCode::BrowserRequestDenied)
+        ));
+        request.headers.clear();
+        assert!(check_diagnosed(&request, &[]).is_ok());
+    }
     use crate::{config::ReadPostOperation, policy::sha256};
     use serde_json::json;
 

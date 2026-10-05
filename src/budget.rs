@@ -28,6 +28,62 @@ pub struct JobLimits {
 }
 
 impl RequestedLimits {
+    pub fn violations(&self, operator: &Limits) -> Vec<crate::error::LimitViolation> {
+        use crate::error::{LimitField, LimitViolation};
+        [
+            (LimitField::Seconds, self.seconds, 1, operator.job_seconds),
+            (LimitField::Bytes, self.bytes, 0, operator.job_bytes),
+            (
+                LimitField::MicroUsd,
+                self.micro_usd,
+                0,
+                operator.job_micro_usd,
+            ),
+            (
+                LimitField::Queries,
+                self.queries.map(u64::from),
+                0,
+                u64::from(operator.queries),
+            ),
+            (
+                LimitField::Documents,
+                self.documents.map(u64::from),
+                0,
+                u64::from(operator.documents),
+            ),
+            (
+                LimitField::Requests,
+                self.requests.map(u64::from),
+                0,
+                u64::from(operator.requests),
+            ),
+            (
+                LimitField::PdfPages,
+                self.pdf_pages.map(u64::from),
+                0,
+                u64::from(operator.pdf_pages),
+            ),
+            (
+                LimitField::BrowserActions,
+                self.browser_actions.map(u64::from),
+                0,
+                u64::from(operator.browser_actions),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(field, requested, minimum, maximum)| {
+            requested
+                .filter(|value| *value < minimum || *value > maximum)
+                .map(|requested| LimitViolation {
+                    field,
+                    requested,
+                    minimum,
+                    maximum,
+                })
+        })
+        .collect()
+    }
+
     pub fn resolve(&self, operator: &Limits) -> Result<JobLimits> {
         let limits = JobLimits {
             seconds: self.seconds.unwrap_or(operator.job_seconds),
@@ -39,16 +95,7 @@ impl RequestedLimits {
             pdf_pages: self.pdf_pages.unwrap_or(operator.pdf_pages),
             browser_actions: self.browser_actions.unwrap_or(operator.browser_actions),
         };
-        if limits.seconds == 0
-            || limits.seconds > operator.job_seconds
-            || limits.bytes > operator.job_bytes
-            || limits.micro_usd > operator.job_micro_usd
-            || limits.queries > operator.queries
-            || limits.documents > operator.documents
-            || limits.requests > operator.requests
-            || limits.pdf_pages > operator.pdf_pages
-            || limits.browser_actions > operator.browser_actions
-        {
+        if !self.violations(operator).is_empty() {
             return Err(ErrorCode::InvalidRequest);
         }
         Ok(limits)

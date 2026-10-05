@@ -127,6 +127,34 @@ impl Bridge {
         arguments: Value,
         stop: CancellationToken,
     ) -> Result<Value> {
+        self.call_detailed(tool, arguments, stop)
+            .await
+            .map_err(|failure| failure.code)
+    }
+
+    pub async fn call_detailed(
+        &self,
+        tool: Tool,
+        arguments: Value,
+        stop: CancellationToken,
+    ) -> std::result::Result<Value, crate::error::ToolFailure> {
+        let value = self.call_wire(tool, arguments, stop).await?;
+        if value.as_object().is_some_and(|object| {
+            object.len() == 2 && object.contains_key("error") && object.contains_key("details")
+        }) {
+            let failure = serde_json::from_value(value).map_err(|_| ErrorCode::InvalidResponse)?;
+            Err(failure)
+        } else {
+            Ok(value)
+        }
+    }
+
+    async fn call_wire(
+        &self,
+        tool: Tool,
+        arguments: Value,
+        stop: CancellationToken,
+    ) -> Result<Value> {
         if stop.is_cancelled() || self.stop.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }

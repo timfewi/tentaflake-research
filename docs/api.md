@@ -53,6 +53,13 @@ UTC-day spending cap. Search attempts consume query slots; summaries consume
 requests, bytes, time and money without consuming extra search slots. Cache hits
 do not incur another upstream charge.
 
+A rejected numeric limit retains `error: "invalid_request"` and includes
+`details.reason: "job_limits"` with all `violations` (typed `field`, `requested`,
+`minimum`, `maximum`). Defaults allow 1–300 seconds; operator configuration can
+lower the ceiling. Zero remains valid for the other resources. Validation neither
+clamps job limits nor creates a job on rejection. Malformed or unknown fields can
+still return a plain `invalid_request`.
+
 `{"operation":"providers"}` returns the same effective `capabilities` before a
 job is started. It allocates no job, consumes no job budget and makes no network
 requests, so it remains available when egress is offline or job capacity is full.
@@ -254,3 +261,22 @@ The initial `hello` confirms version 1 and the exact tool set. IDs increase on
 each connection; responses may finish out of order. There are at most 16 active
 calls per connection and 32 connections. A partial frame body times out after
 30 seconds. Authentication is by Unix peer credentials, not agent-supplied IDs.
+
+Detailed tool failures use the existing v1 JSON value envelope reserved for an
+object with exactly `error` and `details`. The bridge recognizes it as a failure;
+the MCP adapter emits `isError: true`, and the ordinary bridge API still returns
+the original error code. Update client and service together: an older adapter
+cannot interpret the richer failure envelope. Ordinary failures retain the
+existing `Outcome::Error` frame. Successful browser results containing an
+`error: null` or retained partial evidence are not failure envelopes.
+
+Browser denials retain `policy_denied` at the tool boundary and can include
+`details.reason` of `robots_disallowed`, `browser_identity_mismatch`, or
+`browser_request_not_granted`. Browser-mode batch failures put the reason in
+`data.error_details`. These categories disclose no header values, secrets, paths
+or policy recipes. Other policy denials can still lack a more specific reason.
+When `auto` rendering fails, the HTTP evidence remains the primary partial result;
+`render_error` retains the canonical code and `render_error_details` includes a
+safe reason when available. An installed browser capability does not grant
+arbitrary methods, destinations or operations; a denial never authorizes another
+route.

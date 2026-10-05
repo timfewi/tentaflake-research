@@ -285,7 +285,7 @@ impl Fetcher {
         if Instant::now() >= context.deadline {
             return Err(ErrorCode::Timeout);
         }
-        let checked = request::check(&input, &self.config.browser.read_post_rules)?;
+        let checked = request::check_diagnosed(&input, &self.config.browser.read_post_rules)?;
         if input.redirects as usize > self.config.limits.redirects {
             return Err(ErrorCode::SizeLimit);
         }
@@ -301,7 +301,16 @@ impl Fetcher {
                 )?
                 .finish(0, Some(0))?;
         }
-        let warnings = if self.allowed(context, &checked.target).await? {
+        let warnings = if self
+            .allowed(context, &checked.target)
+            .await
+            .map_err(|error| {
+                if error == ErrorCode::PolicyDenied {
+                    ErrorCode::BrowserRobotsDenied
+                } else {
+                    error
+                }
+            })? {
             vec![SourceWarning::RobotsUnavailable]
         } else {
             vec![]
@@ -1417,7 +1426,7 @@ mod tests {
         private.url = "http://127.0.0.1/private".into();
         for (input, expected) in [
             (private, ErrorCode::DestinationDenied),
-            (browser_input("/private"), ErrorCode::PolicyDenied),
+            (browser_input("/private"), ErrorCode::BrowserRobotsDenied),
             (browser_input("/redirect"), ErrorCode::DestinationDenied),
         ] {
             assert_eq!(

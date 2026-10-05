@@ -105,7 +105,24 @@ impl Transport for Upstream {
             // Model IO that finishes after cancellation. The broker must join
             // its ensuing archive write before strict evidence is deleted.
         }
+        let streamed = if path == "/stream-auto" {
+            let cards = (0..20)
+                .map(|n| {
+                    if n < 9 {
+                        format!("<p>Kept card {n} é 👩‍🔬 Unicode quote.</p>")
+                    } else {
+                        format!("<p data-extra>Unfiltered surplus {n} é 👩‍🔬.</p>")
+                    }
+                })
+                .collect::<String>();
+            format!(
+                r#"<!doctype html><head><link rel="icon" href="data:,"></head><main><template id="B:0"></template></main><div hidden id="S:0">{cards}</div><script>function $RC(boundary,payload) {{ const el=document.getElementById(payload);document.getElementById(boundary).replaceWith(el);el.removeAttribute('hidden');for(const extra of el.querySelectorAll('[data-extra]'))extra.remove(); }}$RC("B:0","S:0")</script>"#
+            )
+        } else {
+            String::new()
+        };
         let (status, body) = match path {
+            "/stream-auto" => (200, streamed.as_str()),
             "/robots.txt" if request.target.url().host_str() == Some("warning.example.com") => {
                 (503, "")
             }
@@ -124,7 +141,7 @@ impl Transport for Upstream {
                 "<!doctype html><p id='status'>pending</p><script>fetch('https://other.example.com/read', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{\"query\":\"article\"}'}).then(response => response.text()).then(text => document.getElementById('status').textContent = text).catch(() => document.getElementById('status').textContent = 'blocked');</script>",
             ),
             "/next" => (200, "<!doctype html><p>Next quote.</p>"),
-            "/auto" | "/render-fail" | "/parser-fail" => (
+            "/auto" | "/render-fail" | "/render-policy-denied" | "/parser-fail" => (
                 200,
                 "<!doctype html><head><link rel='icon' href='data:,'></head><p id='text'></p><script>document.querySelector('#text').textContent='Rendered é 👩‍🔬 quote.';</script>",
             ),
@@ -215,6 +232,10 @@ impl Transport for Upstream {
         }
         if checked.target.url().path() == "/render-fail" {
             return Err(ErrorCode::AccessBlocked);
+        }
+        if checked.target.url().path() == "/render-policy-denied" {
+            // Synthetic broker denial isolates the auto-result merge path.
+            return Err(ErrorCode::BrowserRequestDenied);
         }
         self.get(
             owner,
@@ -738,7 +759,7 @@ async fn fetch_modes_and_budgets() {
             .await
             .contains("Rendered é 👩‍🔬 quote.")
     );
-    let before = fixture.upstream.browser_calls.lock().unwrap().len();
+    let before_http = fixture.upstream.browser_calls.lock().unwrap().len();
     let http = call(
         &bridge,
         Tool::ResearchFetch,
@@ -746,6 +767,36 @@ async fn fetch_modes_and_budgets() {
     )
     .await;
     assert_eq!(http["items"][0]["data"]["javascript_required"], true);
+    let streamed_http = call(
+        &bridge,
+        Tool::ResearchFetch,
+        json!({"job_id":id,"mode":"http","urls":["https://example.com/stream-auto"]}),
+    )
+    .await;
+    assert_eq!(streamed_http["coverage"]["partial"], 1);
+    assert_eq!(
+        streamed_http["items"][0]["data"]["javascript_required"],
+        true
+    );
+    let static_text = source_text(&bridge, &streamed_http["items"][0]["data"]["source"]).await;
+    assert_eq!(static_text.matches("Kept card").count(), 9);
+    assert_eq!(static_text.matches("Unfiltered surplus").count(), 11);
+    assert_eq!(
+        fixture.upstream.browser_calls.lock().unwrap().len(),
+        before_http,
+        "HTTP mode invoked browser rendering"
+    );
+    let streamed_auto = call(
+        &bridge,
+        Tool::ResearchFetch,
+        json!({"job_id":id,"mode":"auto","urls":["https://example.com/stream-auto"]}),
+    )
+    .await;
+    assert_eq!(streamed_auto["coverage"]["success"], 1, "{streamed_auto}");
+    let filtered = source_text(&bridge, &streamed_auto["items"][0]["data"]["source"]).await;
+    assert_eq!(filtered.matches("Kept card").count(), 9);
+    assert!(!filtered.contains("Unfiltered surplus"));
+    let before_failures = fixture.upstream.browser_calls.lock().unwrap().len();
     let failures = call(&bridge, Tool::ResearchFetch, json!({"job_id":id,"urls":["https://example.com/denied","https://example.com/private-redirect","https://example.com/robots-denied","https://example.com/parser-fail"]})).await;
     for (index, error) in [
         "access_blocked",
@@ -760,7 +811,7 @@ async fn fetch_modes_and_budgets() {
     }
     assert_eq!(
         fixture.upstream.browser_calls.lock().unwrap().len(),
-        before,
+        before_failures,
         "HTTP failures invoked browser fallback"
     );
     let failed_render = call(
@@ -773,6 +824,28 @@ async fn fetch_modes_and_budgets() {
     assert_eq!(failed_render["items"][0]["error"], "access_blocked");
     let retained = &failed_render["items"][0]["data"];
     assert_eq!(retained["render_error"], "access_blocked");
+    call(
+        &bridge,
+        Tool::ResearchRead,
+        json!({"kind":"metadata","source_id":retained["raw_source_id"]}),
+    )
+    .await;
+    let denied_render = call(
+        &bridge,
+        Tool::ResearchFetch,
+        json!({"job_id":id,"urls":["https://example.com/render-policy-denied"]}),
+    )
+    .await;
+    assert_eq!(denied_render["coverage"]["partial"], 1, "{denied_render}");
+    assert_eq!(denied_render["items"][0]["error"], "policy_denied");
+    let retained = &denied_render["items"][0]["data"];
+    assert_eq!(retained["render_error"], "policy_denied");
+    assert_eq!(
+        retained["render_error_details"]["reason"],
+        "browser_request_not_granted"
+    );
+    assert!(retained["source"]["id"].is_string());
+    assert!(retained["http"].is_null());
     call(
         &bridge,
         Tool::ResearchRead,
@@ -826,7 +899,26 @@ async fn fetch_modes_and_budgets() {
         )
         .await;
         assert_eq!(denied["items"][0]["error"], error, "{denied}");
+        if url.ends_with("/robots-denied") {
+            assert_eq!(
+                denied["items"][0]["data"]["error_details"]["reason"],
+                "robots_disallowed"
+            );
+        }
     }
+    let denied = bridge
+        .call_detailed(
+            Tool::ResearchBrowser,
+            json!({"action":"open","job_id":id,"url":"https://example.com/robots-denied"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code, ErrorCode::PolicyDenied);
+    assert_eq!(
+        serde_json::to_value(denied.details).unwrap()["reason"],
+        "robots_disallowed"
+    );
     let partial = call(
         &bridge,
         Tool::ResearchFetch,

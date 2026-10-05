@@ -95,12 +95,12 @@ impl Adapter {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let result = match serde_json::to_value(args) {
-            Ok(args) => self.bridge.call(tool, args, context.ct).await,
-            Err(_) => Err(crate::error::ErrorCode::InvalidRequest),
+            Ok(args) => self.bridge.call_detailed(tool, args, context.ct).await,
+            Err(_) => Err(crate::error::ErrorCode::InvalidRequest.into()),
         };
         match result {
             Ok(value) => CallToolResult::structured(value),
-            Err(code) => CallToolResult::structured_error(serde_json::json!({"error":code})),
+            Err(failure) => CallToolResult::structured_error(serde_json::json!(failure)),
         }
     }
 }

@@ -424,7 +424,7 @@ impl Actor {
                     return Err(ErrorCode::InvalidRequest);
                 }
                 self.last_request = id;
-                request::check(&input, &self.settings.read_post_rules)?;
+                request::check_diagnosed(&input, &self.settings.read_post_rules)?;
                 let stop = self.stop.child_token();
                 self.pending.insert(
                     id,
