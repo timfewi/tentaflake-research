@@ -1333,6 +1333,7 @@ async fn job_remains_usable_across_multiple_healthy_observer_refreshes() {
         default_route: true,
         firewall_marker: true,
         region: Some("DE".to_owned()),
+        ..Observation::not_ready()
     };
     let monotonic_start = Instant::now();
     let input = observer.update(&observation, chrono::Utc::now().timestamp());

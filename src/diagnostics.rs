@@ -29,6 +29,14 @@ pub enum Event {
     RouteDumpMalformed,
     FirewallMarkerMissing,
     FirewallMarkerInsecure,
+    LinkKindUnreadable,
+    LinkKindMismatch,
+    RuleDumpUnavailable,
+    RuleDumpMalformed,
+    Ipv4PathNotTunnel,
+    Ipv6PathNotContained,
+    DnsPathNotTunnel,
+    DrainMarkerInsecure,
     ObservationLeaseUnavailable,
     ObservationLeaseInvalid,
     ObservationLeaseExpired,
@@ -71,7 +79,15 @@ impl Event {
             | Self::NoDefaultRoute
             | Self::RouteDumpMalformed
             | Self::FirewallMarkerMissing
-            | Self::FirewallMarkerInsecure => "observation",
+            | Self::FirewallMarkerInsecure
+            | Self::LinkKindUnreadable
+            | Self::LinkKindMismatch
+            | Self::RuleDumpUnavailable
+            | Self::RuleDumpMalformed
+            | Self::Ipv4PathNotTunnel
+            | Self::Ipv6PathNotContained
+            | Self::DnsPathNotTunnel
+            | Self::DrainMarkerInsecure => "observation",
             Self::ObservationLeaseUnavailable
             | Self::ObservationLeaseInvalid
             | Self::ObservationLeaseExpired => "observation_lease",

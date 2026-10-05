@@ -62,6 +62,13 @@ Browser/parser process fixtures in `scripts/check` require the pinned executable
 paths and an exact closure file. See [browser-validation.md](browser-validation.md).
 Missing isolation prerequisites fail the fixture; do not disable isolation.
 
+The VPN observer fixture (`scripts/check vpn-observer`) needs the pinned
+Bubblewrap as `RESEARCH_TEST_BWRAP` and a closure file with glibc and the C++
+runtime library as `RESEARCH_TEST_CONTROL_CLOSURE` (a `closureInfo` of
+`p.glibc` and `p.stdenv.cc.cc.lib` from the locked nixpkgs, its `store-paths`).
+It runs the real observer as namespace-root against synthetic route, rule and
+sysfs inputs and never reads host networking; see [vpn-adapters.md](vpn-adapters.md).
+
 The service package source (`nix/source.nix`) admits only regular `.rs` files
 under `src` and `tests`, `Cargo.toml`, `Cargo.lock` and the embedded
 `src/browser/read.js`. It excludes `tests/nix`, hidden paths, build/cache/result
