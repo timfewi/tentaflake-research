@@ -176,3 +176,27 @@ Evidence for this source checkpoint (pinned shell, offline):
 Not run: the NixOS VM tests, a real WireGuard or exit-node tunnel driving the
 observer, tunnel liveness/identity evidence, firewall rule introspection and any
 production-host acceptance.
+
+## VPN observer against a real tunnel (2026-10-05)
+
+`checks.x86_64-linux.network-boundary-wireguard-vm` now runs the real observer and
+controller against a real WireGuard tunnel in two disposable VMs, with the routing
+layout `wg-quick` creates, and the readiness lease for the proxy comes from that
+chain. The test removes the IPv4 and IPv6 tunnel rules, adds an unexpected peer,
+takes the tunnel interface down, drains for a planned exit change and kills the
+observer and the controller; each produced the expected offline, draining or ready
+state and a new generation on recovery, and the observer's diagnostics named the
+failed evidence without addresses, keys or paths. The kernel firewall assertions
+in the same VM still passed. Selected WireGuard evidence (`--handshake-within`,
+`--peer-public-key`) was read from the real kernel dump.
+
+Defects this found that synthetic dumps could not: the kernel reports "no
+suppression" as `FRA_SUPPRESS_PREFIXLEN` = -1 (every table lookup looked
+suppressed; now fixed and covered by a recorded real-kernel dump), and a node
+learns a physical IPv6 default route from router advertisements (a real leak the
+layout must block). It also showed that the received-packet counter is not a
+liveness signal on a WireGuard tunnel (only one side emits keepalives), so liveness
+uses the handshake time instead.
+
+Not run: a Tailscale or other exit node, detection of an aged-out handshake in the
+VM (190 s window; the namespace fixture covers it), and production-host acceptance.
