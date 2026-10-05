@@ -122,6 +122,25 @@ pkgs.testers.runNixOSTest {
           ];
         };
       };
+      # The real observer and controller drive the proxy's readiness lease through
+      # the actual tunnel; they are started by the test after the tunnel is up.
+      systemd.services.research-vpn-observer.serviceConfig = {
+        # The exit's public key is generated at test time and passed through this file.
+        EnvironmentFile = "/run/research-vpn-observer.env";
+        ExecStart = lib.concatStringsSep " " [
+          "${egress}/bin/research-vpn-observer"
+          "--interface wg0 --output /run/research-vpn/observation.json --refresh-seconds 1"
+          "--region DE --firewall-marker /run/research-firewall/ready"
+          "--link-kind wireguard --egress-uid 4002 --dns-resolver 9.9.9.9"
+          "--handshake-within 190 --peer-public-key \${PEER_KEY}"
+          "--drain-marker /run/research-vpn-drain/marker"
+        ];
+      };
+      systemd.services.research-egress-control-test.serviceConfig.ExecStart = lib.concatStringsSep " " [
+        "${egress}/bin/research-egress-control"
+        "--input /run/research-vpn/observation.json"
+        "--output /run/research-test-control/state.json --drain-seconds 20"
+      ];
       networking.nftables.tables.host_direct_exception = {
         family = "inet";
         content = ''
@@ -212,6 +231,33 @@ pkgs.testers.runNixOSTest {
             "&& mv /run/research-test-control/state.tmp /run/research-test-control/state.json"
         )
 
+    def state():
+        return json.loads(research.succeed("cat /run/research-test-control/state.json"))
+
+    def diagnose():
+        for command in [
+            "uname -r",
+            "ip rule",
+            "ip route show table all",
+            "ip -6 rule",
+            "cat /sys/class/net/wg0/statistics/rx_packets /sys/class/net/wg0/uevent",
+            "wg show wg0 transfer",
+            "journalctl -u research-vpn-observer -u research-egress-control-test --no-pager -n 12",
+            "cat /run/research-test-control/state.json /run/research-vpn/observation.json",
+        ]:
+            print("DIAG", command, "->", research.execute(command)[1])
+
+    def wait_mode(mode, timeout=20):
+        pattern = shlex.quote('"mode":"%s"' % mode)
+        try:
+            research.wait_until_succeeds(
+                "grep -q " + pattern + " /run/research-test-control/state.json",
+                timeout=timedelta(seconds=timeout),
+            )
+        except Exception:
+            diagnose()
+            raise
+
     request = b"GET http://9.9.9.2/ HTTP/1.1\r\nHost: 9.9.9.2\r\nConnection: close\r\n\r\n"
     encoded = base64.b64encode(request).decode()
     command = f"printf %s {encoded} | base64 -d | timeout 5s socat - UNIX-CONNECT:/run/research-proxy/socket"
@@ -301,20 +347,103 @@ pkgs.testers.runNixOSTest {
     upstream.succeed("sleep 2")
     upstream.fail("grep -q MARKED_ /tmp/udp-seen")
     research.succeed("nft delete table inet research_test_mark")
-    research.succeed("install -d -m 0755 /run/research-test-control")
+    # Make the tunnel the exit as wg-quick does: a default route in its own table
+    # for unmarked traffic, with main (minus default routes) consulted first. The
+    # outer WireGuard packets carry the mark and keep using the physical path.
+    research.succeed(f"wg set wg0 peer {shlex.quote(upstream_key)} allowed-ips 0.0.0.0/0")
+    research.succeed("ip route add default dev wg0 table 51820")
+    research.succeed("ip rule add priority 32764 table main suppress_prefixlength 0")
+    research.succeed("ip rule add priority 32765 not fwmark 21063 table 51820")
+    # IPv6 has no tunnel here, and the node learns a physical IPv6 default route
+    # from router advertisements: unmarked IPv6 traffic is blocked instead.
+    research.succeed("ip -6 route add blackhole default table 51820")
+    research.succeed("ip -6 rule add priority 32764 table main suppress_prefixlength 0")
+    research.succeed("ip -6 rule add priority 32765 not fwmark 21063 table 51820")
+    research.succeed(probe("10.23.0.2", 4002))
+    research.succeed(probe("198.51.100.2"))
+    research.fail(probe("198.51.100.2", 4002))
+
+    # The actual observer and controller prove readiness from the real tunnel.
+    research.succeed(
+        "install -d -m 0755 /run/research-vpn /run/research-test-control "
+        "/run/research-firewall /run/research-vpn-drain"
+    )
+    research.succeed("install -m 0644 /dev/null /run/research-firewall/ready")
+    research.succeed(f"echo PEER_KEY={shlex.quote(upstream_key)} > /run/research-vpn-observer.env")
+    research.succeed("systemctl start research-vpn-observer.service research-egress-control-test.service")
+    wait_mode("ready", 30)
+    assert state()["region"] == "DE", state()
     research.succeed("systemctl start research-proxy-test.socket")
-    publish_ready()
     research.wait_until_succeeds(proxy_probe, timeout=timedelta(seconds=8))
     research.wait_for_unit("research-proxy-test.service")
+
     research.succeed("systemctl stop research-capture.service")
     packets = research.succeed("tcpdump -nn -r /tmp/research-wg.pcap 2>/dev/null").splitlines()
     assert len(packets) >= 2, packets
     research.fail("grep -a -q RESEARCH_WG_INNER_MARKER /tmp/research-wg.pcap")
     research.fail("grep -a -q synthetic-proxy-over-wireguard /tmp/research-wg.pcap")
 
-    # Losing the tunnel's underlay must not expose egress traffic to the
-    # remaining direct route, even though root can still use that route.
+    # Real kernel evidence: without the tunnel rule the direct main default would
+    # win for the egress identity, so the exit is not ready until it is restored.
+    ready_generation = state()["generation"]
+    research.succeed("ip rule del priority 32765")
+    wait_mode("offline")
+    research.fail(proxy_probe)
+    research.succeed("ip rule add priority 32765 not fwmark 21063 table 51820")
+    wait_mode("ready")
+    assert state()["generation"] != ready_generation
+    # IPv6 must not leave through another interface either: without its blocking
+    # rule the physical IPv6 default from router advertisements would win.
+    research.succeed("ip -6 rule del priority 32765")
+    wait_mode("offline")
+    research.succeed("ip -6 rule add priority 32765 not fwmark 21063 table 51820")
+    wait_mode("ready")
+
+    # The exit is the pinned WireGuard peer: an additional peer is not the exit.
+    stranger = research.succeed("wg genkey | wg pubkey").strip()
+    research.succeed(f"wg set wg0 peer {shlex.quote(stranger)} allowed-ips 10.99.0.1/32")
+    wait_mode("offline")
+    research.succeed(f"wg set wg0 peer {shlex.quote(stranger)} remove")
+    wait_mode("ready")
+
+    # Losing the tunnel interface is offline at once; recovery is a new generation.
+    tunnel_generation = state()["generation"]
+    research.succeed("ip link set wg0 down")
+    wait_mode("offline")
+    research.fail(proxy_probe)
+    research.succeed("ip link set wg0 up")
+    research.succeed("ip route add default dev wg0 table 51820")
+    wait_mode("ready", 30)
+    assert state()["generation"] != tunnel_generation
+
+    # A planned exit change drains the current generation and then starts a new one.
+    drained_generation = state()["generation"]
+    research.succeed("install -m 0644 /dev/null /run/research-vpn-drain/marker")
+    wait_mode("draining")
+    assert state()["generation"] == drained_generation
+    research.succeed("rm -f /run/research-vpn-drain/marker")
+    wait_mode("ready")
+    assert state()["generation"] != drained_generation
+
+    # A dead observer or controller never leaves the exit ready: the last lease
+    # expires and new work is refused. A restarted process starts a new epoch.
+    research.succeed("systemctl kill --signal=SIGKILL research-vpn-observer.service")
+    wait_mode("offline", 25)
+    research.fail(proxy_probe)
+    research.succeed("systemctl start research-vpn-observer.service")
+    wait_mode("ready", 30)
+    research.wait_until_succeeds(proxy_probe, timeout=timedelta(seconds=8))
+    research.succeed("systemctl kill --signal=SIGKILL research-egress-control-test.service")
+    research.wait_until_fails(proxy_probe, timeout=timedelta(seconds=10))
+    research.succeed("systemctl start research-egress-control-test.service")
+    wait_mode("ready", 30)
+    research.wait_until_succeeds(proxy_probe, timeout=timedelta(seconds=8))
+
+    # Losing the tunnel's underlay is not seen by the observer until the last
+    # handshake ages out (up to the 190 s window), so the firewall alone must
+    # hold with a ready lease, even though root can still use the direct route.
     research.succeed("ip link set eth1 down")
+    research.succeed("systemctl stop research-vpn-observer.service research-egress-control-test.service")
     publish_ready()
     research.fail(proxy_probe)
     research.fail(probe("10.23.0.2", 4002))
