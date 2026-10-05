@@ -51,7 +51,8 @@ unmarked WireGuard tunnel may be fail-closed but unusable for Research.
 This fragment does not detect an encrypted tunnel, authenticate an exit, restrict
 public destinations/ports by itself, or implement a VPN provider. URL/address,
 port, DNS-answer and own-host-address policy remain in the Rust proxy. Readiness
-comes from the separate trusted [observation contract](egress-control.md).
+comes from the separate trusted [observation contract](egress-control.md); the
+evidence an adapter must observe is specified in [vpn-adapters.md](vpn-adapters.md).
 
 ## Current evidence
 

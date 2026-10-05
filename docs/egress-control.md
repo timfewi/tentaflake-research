@@ -46,7 +46,9 @@ adapter and controller both fail.
 ## Reference observer
 
 `research-vpn-observer` is an optional root producer that writes the observation
-lease above. It is **disabled by default** in the module (`vpnObserver.enable`)
+lease above. [vpn-adapters.md](vpn-adapters.md) specifies the evidence any adapter
+must observe, what stays an operator assertion and how a planned exit change is
+reported. It is **disabled by default** in the module (`vpnObserver.enable`)
 because the operator may already have an adapter; enabling it never fabricates
 readiness — it only publishes what the checks below prove. It runs as root and
 requires its output directory to be root-controlled and distinct from the
@@ -63,7 +65,8 @@ that cadence. The default therefore has five seconds of renewal headroom for
 fractional wall-clock truncation and bounded collection/scheduling delay while a
 dead observer still fails closed within the original ten-second contract bound.
 
-Each refresh gathers four pieces of local, non-cryptographic evidence:
+Each refresh gathers four pieces of local, non-cryptographic evidence (the
+firewall marker and the region are operator assertions, not observed identity):
 
 - `interface_up`: `/sys/class/net/<interface>/flags` exists and has `IFF_UP`
   (`0x1`) set.
@@ -78,13 +81,19 @@ Each refresh gathers four pieces of local, non-cryptographic evidence:
 - `region`: the operator-declared `--region` (`None` or exactly two ASCII
   uppercase letters). It is never inferred.
 
-Ready requires all three boolean checks and a valid region; anything else is
-`offline` with no region. Missing, unreadable or malformed inputs fail closed.
+Operators can additionally select `--link-kind wireguard|tun`, `--egress-uid` with
+one `--dns-resolver` per configured resolver (the egress identity's IPv4, IPv6 and
+resolver paths through the policy-routing rules) and `--drain-marker` (planned exit
+change, reported as `draining`). Nothing is selected by default. Ready requires
+all checks, including selected ones, and a valid region; anything else is `offline`
+with no region. Missing, unreadable or malformed inputs fail closed.
 The observer keeps running and writes one bounded JSON object per diagnostic to
 stderr using schema `secure-research-diagnostic/v1`. Events include
 `interface_down`, `interface_flags_unreadable`, `route_dump_unavailable`,
-`no_default_route` and `firewall_marker_insecure`; records never contain input
-data, paths, interface names or regions. The lease is renewed every
+`no_default_route`, `firewall_marker_insecure`, `link_kind_mismatch`,
+`ipv4_path_not_tunnel`, `ipv6_path_not_contained`, `dns_path_not_tunnel`,
+`rule_dump_malformed` and `drain_marker_insecure`; records never contain input
+data, paths, addresses, interface names or regions. The lease is renewed every
 `--refresh-seconds` (1–5, default 5) with an independent ten-second lifetime. On
 `SIGTERM`/`SIGINT` it publishes `offline` before exit.
 
@@ -92,13 +101,15 @@ The observed generation stays stable while the exit is continuously Ready with t
 same region. A fresh UUID is minted on every transition into Ready, on any region
 change and after a restart, so an old browser session is never revived.
 
-**Honest limitation.** The observer proves interface-up, an IPv4 default route on
-that interface, a firewall marker and the operator-declared region. It does **not**
-prove the cryptographic exit identity of the encrypted tunnel, the tunnel
-peer/cipher, the actual firewall rules, or an IPv6 default route; IPv6 proof is
-delegated to the kernel firewall invariant, which remains the independent
-guarantee even if the observer and controller both fail. Treat the region as an
-operator assertion, not as observed exit identity.
+**Honest limitation.** By default the observer proves interface-up, an IPv4 default
+route on that interface, a firewall marker and the operator-declared region. With
+`--egress-uid` it also evaluates the egress identity's IPv4, IPv6 and resolver
+paths; the evaluation is conservative and does not cover specific non-default
+routes beyond the resolvers. It does **not** prove the cryptographic exit identity
+of the encrypted tunnel, the tunnel peer/cipher or the firewall rules that are
+actually loaded; the kernel firewall invariant remains the independent guarantee
+even if the observer and controller both fail. Treat the region as an operator
+assertion, not as observed exit identity.
 
 ## Controller lifecycle
 
@@ -144,14 +155,15 @@ SIGTERM and crash expiry. This is not evidence for host VPN detection, firewall
 rules, systemd deployment or packet confinement. See [development.md](development.md)
 for reproducible commands and [verification.md](verification.md) for open gates.
 
-Five unit tests cover the observer state machine: ready/offline, each failed
-check, invalid regions, generation rotation on region change, recovery and
-restart, and the refresh bound. Seven further unit tests cover the netlink
-route-dump parser, including a default route found in a policy-routing table.
+Unit tests cover the observer state machine (including planned draining and
+selected evidence), the route and rule dump parsers and policy-routing evaluation,
+and an observer-to-controller chain for tunnel loss, exit change, draining,
+stale leases and restarts; see [vpn-adapters.md](vpn-adapters.md).
 `scripts/check vpn-observer` runs the actual observer binary as root **inside a
-private user namespace** against synthetic `--sysfs`/`--route-dump` inputs, a
-synthetic marker and a temporary output directory. It checks publication,
-region, locking, fail-closed transitions, `SIGTERM` shutdown and restart. This
-is not evidence for a real VPN, real interface flags, real route tables, real
+private user namespace** against synthetic `--sysfs`, `--route-dump` and
+`--rule-dump` inputs, synthetic markers and a temporary output directory. It
+checks publication, region, leak detection per dimension, link kind, draining,
+fail-closed transitions, diagnostics, locking, `SIGTERM` shutdown and restart.
+This is not evidence for a real VPN, real interface flags, real route tables, real
 firewall rules or systemd deployment; the fixture never inspects host
 networking.

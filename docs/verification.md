@@ -147,3 +147,32 @@ never echoed. Evidence: the client gate (`scripts/check client`) passed, includi
 unit tests for the diagnostic and end-to-end client-transport tests that run the
 binary against a listener asserting that no connection is made. Not run: package
 builds, the host `curl` wrapper and live requests.
+
+## VPN readiness evidence and planned draining (2026-10-05)
+
+The reference observer can now observe, when explicitly selected, the link kind,
+the egress identity's IPv4 tunnel path, IPv6 containment and resolver paths
+(policy-routing rules evaluated conservatively over NETLINK_ROUTE dumps), and report
+a planned exit change as `draining`. [vpn-adapters.md](vpn-adapters.md) specifies
+the evidence classes; markers and regions remain operator assertions. Defaults,
+the lease contract and the independent firewall are unchanged.
+
+Evidence for this source checkpoint (pinned shell, offline):
+
+- Unit tests for the dump parsers and policy-routing evaluation (`wg-quick`,
+  Tailscale exit-node and `uidrange` layouts, IPv4/IPv6/DNS leaks, direct
+  fallbacks, undecidable selectors, malformed dumps), the observer state machine
+  with draining, and an observer-to-controller chain (tunnel loss, exit change,
+  planned drain and its deadline, stale lease, observer and controller restart,
+  recovery) passed, as did the NixOS module evaluation tests for the new options
+  (a mutation of one expectation made them fail).
+- `scripts/check vpn-observer` passed with the pinned Bubblewrap and a glibc
+  closure: the real observer detected an IPv4, IPv6 and resolver leak, a wrong link
+  kind and a malformed rule dump, drained and resumed under a new generation,
+  treated a group-writable drain marker as offline, and its diagnostics named no
+  address, path or interface. The fixture found one defect the unit tests could
+  not (a missing drain marker was treated as untrustworthy), which is fixed.
+
+Not run: the NixOS VM tests, a real WireGuard or exit-node tunnel driving the
+observer, tunnel liveness/identity evidence, firewall rule introspection and any
+production-host acceptance.
