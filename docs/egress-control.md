@@ -83,15 +83,17 @@ firewall marker and the region are operator assertions, not observed identity):
 
 Operators can additionally select `--link-kind wireguard|tun`, `--egress-uid` with
 one `--dns-resolver` per configured resolver (the egress identity's IPv4, IPv6 and
-resolver paths through the policy-routing rules) and `--drain-marker` (planned exit
-change, reported as `draining`). Nothing is selected by default. Ready requires
+resolver paths through the policy-routing rules), for WireGuard
+`--handshake-within` and `--peer-public-key` (a recent handshake and the pinned
+peer set), and `--drain-marker` (planned exit change, reported as `draining`). Nothing is selected by default. Ready requires
 all checks, including selected ones, and a valid region; anything else is `offline`
 with no region. Missing, unreadable or malformed inputs fail closed.
 The observer keeps running and writes one bounded JSON object per diagnostic to
 stderr using schema `secure-research-diagnostic/v1`. Events include
 `interface_down`, `interface_flags_unreadable`, `route_dump_unavailable`,
 `no_default_route`, `firewall_marker_insecure`, `link_kind_mismatch`,
-`ipv4_path_not_tunnel`, `ipv6_path_not_contained`, `dns_path_not_tunnel`,
+`ipv4_path_not_tunnel`, `ipv6_path_not_contained`, `dns_path_not_tunnel`, `handshake_stale`, `peer_set_mismatch`,
+`peer_evidence_unavailable`, `peer_evidence_malformed`,
 `rule_dump_malformed` and `drain_marker_insecure`; records never contain input
 data, paths, addresses, interface names or regions. The lease is renewed every
 `--refresh-seconds` (1–5, default 5) with an independent ten-second lifetime. On
@@ -161,7 +163,7 @@ and an observer-to-controller chain for tunnel loss, exit change, draining,
 stale leases and restarts; see [vpn-adapters.md](vpn-adapters.md).
 `scripts/check vpn-observer` runs the actual observer binary as root **inside a
 private user namespace** against synthetic `--sysfs`, `--route-dump` and
-`--rule-dump` inputs, synthetic markers and a temporary output directory. It
+`--rule-dump` and `--wireguard-dump` inputs, synthetic markers and a temporary output directory. It
 checks publication, region, leak detection per dimension, link kind, draining,
 fail-closed transitions, diagnostics, locking, `SIGTERM` shutdown and restart.
 This is not evidence for a real VPN, real interface flags, real route tables, real

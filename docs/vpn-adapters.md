@@ -29,7 +29,7 @@ and neither is observed tunnel identity.
 | E4 DNS | Every configured resolver is reached only through the tunnel for the egress identity | `--dns-resolver` (requires `--egress-uid`), longest-prefix match | offline |
 | E5 Policy routing | Rules are applied in kernel order: priority, `uidrange`, `fwmark`/mask, `not` (inverted), input interface and `suppress_prefixlength` | `--egress-uid` | offline |
 | E6 Direct-path denial | No possible outcome of E2/E3/E5 uses a non-tunnel interface; a direct fallback beside a tunnel route counts as a leak | `--egress-uid` | offline |
-| E7 Tunnel liveness and identity | Recent handshake, pinned peer key or exit identity | **Not observed** (see below) | n/a |
+| E7 Tunnel liveness and identity | The configured peer is alive and is the intended exit | WireGuard only: `--handshake-within` (a recent handshake) and `--peer-public-key` (the peers are exactly the pinned keys), from the kernel's WireGuard netlink dump. Other implementations: **not observed** | offline when selected and not met |
 | E8 Firewall | The kernel rules exist | Marker only: an assertion | offline without the marker |
 | E9 Region | The exit region | Declared only: an assertion | offline if malformed |
 
@@ -49,12 +49,30 @@ Typical layouts the evaluation understands, all verified with synthetic dumps:
 
 ### E7: tunnel liveness and exit identity
 
-Reading a WireGuard handshake or a peer key needs the WireGuard netlink family or
-the VPN client's control interface, and must never read private keys or
-credentials. The reference observer does not do this. An adapter that needs it
-must run as root, publish an ordinary lease, expose no key material and report
-`offline` as soon as its proof lapses. Until then the exit region and identity are
-operator assertions.
+WireGuard authenticates every handshake with the peer's key, so a recent
+handshake shows that the configured peer is alive and the peer set is the exit's
+identity. `--handshake-within SECONDS` requires the peers to have completed a
+handshake within the window (use 180 or more: a session expires after 180 s and a
+keepalive tunnel re-handshakes about every two minutes), and `--peer-public-key`
+(repeatable, at most four) requires the interface's peers to be exactly the pinned
+keys; both need `--link-kind wireguard`. A dead tunnel is therefore detected only
+when its last handshake ages out (up to the window); a vanished interface, route or
+peer is detected at once.
+
+The data comes from the kernel's WireGuard generic-netlink device dump, which needs
+`CAP_NET_ADMIN` (the module adds exactly that capability to the observer unit when
+this evidence is selected). The same dump also carries the interface's private key
+and any preshared keys. The observer parses only each peer's public key and
+handshake time, never copies, stores or logs a secret attribute, and scrubs the
+receive buffers. Public keys are not secret and appear in the configuration.
+
+An interface's received-packet counter is **not** a usable liveness signal: with
+persistent keepalive on both ends only one side emits keepalives (every received
+packet resets the other side's timer), so the passive side's counter stands still
+on a healthy tunnel. Other VPN implementations (for example Tailscale's tun) have
+no such evidence here; an adapter that needs it must run as root, publish an
+ordinary lease, expose no key material and report `offline` as soon as its proof
+lapses. Until then the exit region and identity are operator assertions.
 
 ## Lease and lifecycle requirements
 
@@ -86,6 +104,7 @@ unchanged. Options of `services.secureResearch.vpnObserver`:
 | --- | --- | --- |
 | `linkKind` | `--link-kind` | E1 link kind |
 | `egressPathEvidence` | `--egress-uid`, one `--dns-resolver` per configured resolver | E2–E6 for the egress identity |
+| `handshakeWithinSeconds`, `peerPublicKeys` | `--handshake-within`, `--peer-public-key` | E7 liveness and identity (WireGuard) |
 | `drainMarker` | `--drain-marker` | Planned exit change |
 
 A planned exit change: create the root-owned drain marker, wait for the
@@ -107,18 +126,26 @@ are root-owned and projected read-only to service identities.
 
 ## Evidence in this repository
 
-- Unit tests: route and rule parsing, the conservative evaluation (IPv4, IPv6,
-  DNS, policy routing, direct-path denial), the observer state machine including
-  draining, and an observer-to-controller chain covering tunnel loss, exit change,
-  planned draining and its deadline, stale leases, observer and controller restart,
-  and recovery.
+- Unit tests: route, rule and WireGuard dump parsing, the conservative evaluation
+  (IPv4, IPv6, DNS, policy routing, direct-path denial, a recorded real-kernel
+  dump), the observer state machine including draining, and an
+  observer-to-controller chain covering tunnel loss, exit change, planned draining
+  and its deadline, stale leases, observer and controller restart, and recovery.
 - `scripts/check vpn-observer` runs the real binary as namespace-root against
-  synthetic layouts: leak detection per dimension, link kind, malformed dumps,
-  planned draining, an untrustworthy drain marker, diagnostics without addresses or
-  paths, locking and shutdown.
-- The firewall VM tests ([network-boundary.md](network-boundary.md)) cover direct-path
-  denial, IPv4/IPv6 and DNS packets for the kernel rules.
+  synthetic layouts: leak detection per dimension, link kind, handshake age and peer
+  pins, malformed dumps, planned draining, an untrustworthy drain marker,
+  diagnostics without addresses, keys or paths, locking and shutdown.
+- `checks.x86_64-linux.network-boundary-wireguard-vm` runs the real observer and
+  controller against a real WireGuard tunnel in a disposable VM, in the layout
+  `wg-quick` creates: the readiness lease for the proxy comes from the chain, and
+  the test removes the tunnel rule (IPv4 and IPv6), adds an unexpected peer, takes
+  the tunnel interface down, drains for a planned exit change and kills the
+  observer and the controller. The kernel firewall tests in the same VM still run.
+- The firewall VM tests ([network-boundary.md](network-boundary.md)) cover
+  direct-path denial, IPv4/IPv6 and DNS packets for the kernel rules.
 
-Not shown: a real tunnel or exit node driving the observer, E7, the rule set the
-firewall actually loaded, or acceptance on a production host. Synthetic results
-are not production acceptance.
+Not shown: another VPN implementation (for example a Tailscale exit node) driving
+the observer, E7 for anything but WireGuard, detection of a stale handshake in the
+VM (the window is 190 s; the namespace fixture covers it), the rule set the
+firewall actually loaded, or acceptance on a production host. VM and synthetic
+results are not production acceptance.

@@ -89,8 +89,11 @@ the egress UID reaches the peer only through `wg0` with the trusted outer mark.
 The egress UID cannot set `SO_MARK` in the VM but can bind a socket to `wg0`.
 The packaged `research-egress` accepts an HTTP request from the service UID
 through its activated Unix socket and receives a response from a synthetic
-upstream reachable only through `wg0`. A root-written synthetic Ready lease
-enables this test path; it does not exercise the observer or controller. A
+upstream reachable only through `wg0`. The readiness lease for this
+path comes from the real observer and controller (see
+[vpn-adapters.md](vpn-adapters.md)), whose failure behavior the test also exercises
+against the real tunnel; the firewall assertions that follow use a synthetic Ready
+lease again, so they hold even when readiness is claimed. A
 capture on the physical underlay contains WireGuard UDP packets but neither
 synthetic inner payload nor the upstream response marker. Bringing that
 underlay down breaks the proxy request and tunnel traffic while root still
