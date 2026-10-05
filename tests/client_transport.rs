@@ -250,3 +250,89 @@ async fn curl_binary_rejects_an_incompatible_unix_peer() {
         .unwrap()
         .unwrap();
 }
+
+async fn run_curl(socket: &std::path::Path, arguments: &[&str]) -> std::process::Output {
+    let child = Command::new(env!("CARGO_BIN_EXE_research-curl"))
+        .arg("--socket")
+        .arg(socket)
+        .args(arguments)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// Nothing may connect: argument, help and version handling never starts a job.
+async fn assert_never_contacted(listener: &UnixListener) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), listener.accept())
+            .await
+            .is_err(),
+        "research-curl contacted the Research socket"
+    );
+}
+
+#[tokio::test]
+async fn curl_binary_explains_unsupported_options_without_contacting_research() {
+    let (_root, socket, listener) = listener();
+    for arguments in [
+        &["-sS", "-D", "headers.txt", "https://example.org/"][..],
+        &["-o", "page.html", "https://example.org/"],
+        &["-H", "Authorization: Bearer secret", "https://example.org/"],
+        &["https://example.org/", "https://example.net/?token=1"],
+    ] {
+        let result = run_curl(&socket, arguments).await;
+        assert_eq!(result.status.code(), Some(2), "{arguments:?}");
+        assert!(result.stdout.is_empty());
+        let message = String::from_utf8(result.stderr).unwrap();
+        assert!(message.starts_with("research-curl: "), "{message}");
+        assert!(message.contains("GET-only"), "{message}");
+        assert!(message.contains("not full curl"), "{message}");
+        assert!(
+            message.contains("research-curl -fsSL --max-time 25 https://example.com/ > page.html")
+        );
+        assert!(message.contains("response headers") && message.contains("research_fetch"));
+        assert!(
+            !message.contains("to pass") && !message.contains("-- -"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("secret") && !message.contains("token"),
+            "{message}"
+        );
+    }
+    assert_never_contacted(&listener).await;
+}
+
+#[tokio::test]
+async fn curl_binary_names_the_unsupported_option_and_answers_version_and_help_locally() {
+    let (_root, socket, listener) = listener();
+    let rejected = run_curl(&socket, &["-D", "headers.txt", "https://example.org/"]).await;
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("unsupported option '-D'"));
+
+    for flag in ["--version", "-V"] {
+        let version = run_curl(&socket, &[flag]).await;
+        assert!(version.status.success(), "{flag}");
+        let text = String::from_utf8(version.stdout).unwrap();
+        assert_eq!(
+            text.lines().next().unwrap(),
+            format!("research-curl {}", env!("CARGO_PKG_VERSION"))
+        );
+        if flag == "--version" {
+            assert!(text.contains("not curl") && text.contains("Supported options"));
+        }
+    }
+    let help = run_curl(&socket, &["--help"]).await;
+    assert!(help.status.success());
+    let text = String::from_utf8(help.stdout).unwrap();
+    assert!(text.contains("not full curl") && text.contains("> page.html"));
+    assert!(text.contains("--max-time"));
+    assert_never_contacted(&listener).await;
+}
