@@ -1,20 +1,83 @@
 //! The five typed MCP operations. These schemas do not expose file paths,
 //! headers, scripts, provider endpoints, network policy or arbitrary browser APIs.
 
+#[cfg(feature = "service")]
 use crate::archive::{Representation, Source};
-use crate::budget::RequestedLimits;
 use crate::error::{ErrorCode, Result};
-use crate::provider::SearchQuery;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub use crate::config::{MAX_CRAWL_DEPTH, MAX_CRAWL_PAGES, MAX_FETCH_BATCH, MAX_SEARCH_BATCH};
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct RequestedLimits {
+    pub seconds: Option<u64>,
+    pub bytes: Option<u64>,
+    pub micro_usd: Option<u64>,
+    pub queries: Option<u32>,
+    pub documents: Option<u32>,
+    pub requests: Option<u32>,
+    pub pdf_pages: Option<u32>,
+    pub browser_actions: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SearchQuery {
+    pub q: String,
+    #[serde(default = "default_count")]
+    pub count: u8,
+    pub language: Option<String>,
+    pub country: Option<String>,
+    pub freshness: Option<Freshness>,
+}
+
+fn default_count() -> u8 {
+    10
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+pub enum Freshness {
+    #[serde(rename = "pd")]
+    Day,
+    #[serde(rename = "pw")]
+    Week,
+    #[serde(rename = "pm")]
+    Month,
+    #[serde(rename = "py")]
+    Year,
+}
+
+impl SearchQuery {
+    pub fn validate(&self) -> Result<()> {
+        if self.q.trim().is_empty()
+            || self.q.chars().count() > 600
+            || self.q.split_whitespace().count() > 75
+            || self.q.contains('\0')
+            || !(1..=20).contains(&self.count)
+            || self.language.as_ref().is_some_and(|v| {
+                !(2..=8).contains(&v.len())
+                    || !v.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+            })
+            || self
+                .country
+                .as_ref()
+                .is_some_and(|v| v.len() != 2 || !v.bytes().all(|b| b.is_ascii_uppercase()))
+        {
+            return Err(ErrorCode::InvalidRequest);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 #[schemars(transform = object_root)]
 pub enum JobArgs {
+    /// Inspect effective optional adapters without creating a job or using egress.
+    Providers {},
     Start {
         #[serde(default)]
         limits: RequestedLimits,
@@ -245,6 +308,7 @@ impl Coverage {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg(feature = "service")]
 pub struct SourceBrief {
     pub id: Uuid,
     pub job_id: Uuid,
@@ -260,6 +324,7 @@ pub struct SourceBrief {
     pub warnings: Vec<crate::archive::SourceWarning>,
 }
 
+#[cfg(feature = "service")]
 impl From<&Source> for SourceBrief {
     fn from(source: &Source) -> Self {
         Self {

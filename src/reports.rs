@@ -3,7 +3,6 @@
 
 use crate::error::{ErrorCode, Result};
 use crate::policy::sha256;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -28,19 +27,7 @@ pub struct Reports {
     seconds: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ReportChunk {
-    pub report_id: Uuid,
-    pub encoding: String,
-    pub content: String,
-    pub start: u64,
-    pub end: u64,
-    pub total: u64,
-    pub sha256: String,
-    pub truncated: bool,
-    pub next_start: Option<u64>,
-    pub untrusted: bool,
-}
+pub use crate::protocol::ReportChunk;
 
 impl Reports {
     pub fn new(maximum: usize, seconds: u64) -> Self {

@@ -28,7 +28,7 @@ impl Adapter {
 
     #[tool(
         name = "research_job",
-        description = "Start, inspect, finish or cancel a bounded public-research job. Returns job.id, remaining job budgets and granted capabilities with per-request cost ceilings. Search-query slots exclude model judgments. Reuse the job; finish/cancel it to release capacity. Sources with storage_not_permitted remain readable within the job and are removed at job end."
+        description = "Inspect effective optional adapters with operation=providers without creating a job or making network requests; or start, inspect, finish or cancel a bounded public-research job. Returns job.id, remaining job budgets and granted capabilities with per-request cost ceilings. Search-query slots exclude model judgments. Reuse the job; finish/cancel it to release capacity. Sources with storage_not_permitted remain readable within the job and are removed at job end."
     )]
     async fn job(
         &self,
@@ -95,12 +95,12 @@ impl Adapter {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let result = match serde_json::to_value(args) {
-            Ok(args) => self.bridge.call(tool, args, context.ct).await,
-            Err(_) => Err(crate::error::ErrorCode::InvalidRequest),
+            Ok(args) => self.bridge.call_detailed(tool, args, context.ct).await,
+            Err(_) => Err(crate::error::ErrorCode::InvalidRequest.into()),
         };
         match result {
             Ok(value) => CallToolResult::structured(value),
-            Err(code) => CallToolResult::structured_error(serde_json::json!({"error":code})),
+            Err(failure) => CallToolResult::structured_error(serde_json::json!(failure)),
         }
     }
 }

@@ -1,8 +1,11 @@
 use crate::error::{ErrorCode, Result};
+#[cfg(feature = "service")]
 use crate::policy::PublicUrl;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "service")]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
@@ -324,6 +327,7 @@ pub enum ProfilePolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg(feature = "service")]
 pub struct BrowserConfig {
     pub enable: bool,
     pub sandbox: Option<crate::browser::sandbox::SandboxConfig>,
@@ -335,6 +339,7 @@ pub struct BrowserConfig {
     pub profile: ProfilePolicy,
 }
 
+#[cfg(feature = "service")]
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
@@ -352,6 +357,7 @@ impl Default for BrowserConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg(feature = "service")]
 pub struct Config {
     pub version: u32,
     pub socket_path: PathBuf,
@@ -378,6 +384,7 @@ pub struct Config {
     pub workers: Option<crate::worker::WorkerConfig>,
 }
 
+#[cfg(feature = "service")]
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -390,7 +397,7 @@ impl Default for Config {
             allowed_client_uids: Vec::new(),
             privacy: Privacy::default(),
             providers: BTreeMap::new(),
-            search_order: vec!["brave".into()],
+            search_order: Vec::new(),
             // Empty by default: an existing search-only deployment must keep
             // validating unchanged, and no provider is enabled implicitly.
             scrape_order: Vec::new(),
@@ -405,6 +412,7 @@ impl Default for Config {
     }
 }
 
+#[cfg(feature = "service")]
 impl Config {
     pub fn validate(&self) -> Result<()> {
         self.limits.validate()?;
@@ -511,8 +519,7 @@ impl Config {
         }
         // Once any provider is configured, all orders must only reference
         // configured providers so an operator cannot silently rank one this
-        // deployment does not have. The built-in placeholder search order
-        // ("brave") is tolerated while the provider map is still empty. The
+        // deployment does not have. Defaults select no commercial provider. The
         // orders are pairwise disjoint: a provider serves exactly one capability.
         if self
             .search_order
@@ -639,6 +646,7 @@ impl Config {
     }
 }
 
+#[cfg(feature = "service")]
 fn credential_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
@@ -651,6 +659,7 @@ fn credential_name(value: &str) -> bool {
 /// query, userinfo or fragment. The egress proxy still re-resolves the host and
 /// enforces the public-address policy for every request, so this only bounds the
 /// operator-authored shape and cannot widen the network boundary.
+#[cfg(feature = "service")]
 fn public_origin(value: &str) -> bool {
     value.starts_with("https://") && PublicUrl::parse(value).is_ok_and(|url| url.origin() == value)
 }
@@ -711,7 +720,7 @@ impl EgressConfig {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "service"))]
 mod tests {
     use super::*;
 
@@ -769,6 +778,16 @@ mod tests {
         let mut empty = configured();
         empty.robots.user_agent.clear();
         assert!(empty.validate().is_err());
+    }
+
+    #[test]
+    fn defaults_do_not_select_a_provider() {
+        let config = configured();
+        config.validate().unwrap();
+        assert!(config.providers.is_empty());
+        assert!(config.search_order.is_empty());
+        assert!(config.scrape_order.is_empty());
+        assert!(config.summarize_order.is_empty());
     }
 
     #[test]

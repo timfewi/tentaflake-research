@@ -285,7 +285,7 @@ impl Fetcher {
         if Instant::now() >= context.deadline {
             return Err(ErrorCode::Timeout);
         }
-        let checked = request::check(&input, &self.config.browser.read_post_rules)?;
+        let checked = request::check_diagnosed(&input, &self.config.browser.read_post_rules)?;
         if input.redirects as usize > self.config.limits.redirects {
             return Err(ErrorCode::SizeLimit);
         }
@@ -301,7 +301,16 @@ impl Fetcher {
                 )?
                 .finish(0, Some(0))?;
         }
-        let warnings = if self.allowed(context, &checked.target).await? {
+        let warnings = if self
+            .allowed(context, &checked.target)
+            .await
+            .map_err(|error| {
+                if error == ErrorCode::PolicyDenied {
+                    ErrorCode::BrowserRobotsDenied
+                } else {
+                    error
+                }
+            })? {
             vec![SourceWarning::RobotsUnavailable]
         } else {
             vec![]
@@ -464,9 +473,7 @@ impl Fetcher {
             Err(error) => record.error = Some(error),
             Ok(parsed) => {
                 let mut evidence = vec![dom()];
-                if !parsed.warnings.is_empty() {
-                    warnings.push(SourceWarning::PartialExtraction);
-                }
+                extraction_warnings(&parsed.warnings, &mut warnings, true);
                 if !parsed.links.is_empty() {
                     evidence.push(Evidence {
                         kind: RepresentationKind::Links,
@@ -493,7 +500,7 @@ impl Fetcher {
                     evidence.push(Evidence {
                         kind: RepresentationKind::Text,
                         bytes: readable.into_bytes(),
-                        extraction_version: "dom_smoothie/0.18.0;raw-text".into(),
+                        extraction_version: worker::READABLE_EXTRACTION_VERSION.into(),
                         derived_from: Some(0),
                         pdf_page: None,
                         text: true,
@@ -627,21 +634,12 @@ impl Fetcher {
                 record.links = parsed.links;
                 record.javascript_hint = matches!(kind, DocumentKind::Html)
                     && parsed
-                        .pages
-                        .iter()
-                        .map(|p| p.chars().count())
-                        .sum::<usize>()
-                        < 200
-                    && response
-                        .body
-                        .windows(7)
-                        .any(|w| w.eq_ignore_ascii_case(b"<script"));
+                        .warnings
+                        .contains(&crate::worker::ExtractionWarning::JavascriptRequired);
                 if record.javascript_hint {
                     warnings.push(SourceWarning::JavascriptRequired);
                 }
-                if !parsed.warnings.is_empty() {
-                    warnings.push(SourceWarning::PartialExtraction);
-                }
+                extraction_warnings(&parsed.warnings, &mut warnings, false);
                 let mut evidence = vec![raw(&response.body)];
                 if !record.links.is_empty() {
                     evidence.push(Evidence {
@@ -672,7 +670,7 @@ impl Fetcher {
                     evidence.push(Evidence {
                         kind: RepresentationKind::Text,
                         bytes: readable.into_bytes(),
-                        extraction_version: "dom_smoothie/0.18.0;raw-text".into(),
+                        extraction_version: worker::READABLE_EXTRACTION_VERSION.into(),
                         derived_from: Some(0),
                         pdf_page: None,
                         text: true,
@@ -1061,6 +1059,34 @@ fn browser_status(
     Ok(())
 }
 
+fn extraction_warnings(
+    parsed: &[crate::worker::ExtractionWarning],
+    warnings: &mut Vec<SourceWarning>,
+    rendered: bool,
+) {
+    use crate::worker::ExtractionWarning;
+    for warning in parsed {
+        // Scripts can remain in a rendered DOM whose short text was actually
+        // observed. The HTTP-only JS heuristic cannot invalidate that evidence.
+        if rendered && *warning == ExtractionWarning::JavascriptRequired {
+            continue;
+        }
+        let mapped = match warning {
+            ExtractionWarning::ReadabilityUnavailable => SourceWarning::ReadabilityUnavailable,
+            ExtractionWarning::StreamingHtmlRecovered => SourceWarning::StreamingHtmlRecovered,
+            ExtractionWarning::PageShell => SourceWarning::PageShell,
+            ExtractionWarning::JavascriptRequired => SourceWarning::JavascriptRequired,
+            _ => SourceWarning::PartialExtraction,
+        };
+        if !warnings
+            .iter()
+            .any(|existing| std::mem::discriminant(existing) == std::mem::discriminant(&mapped))
+        {
+            warnings.push(mapped);
+        }
+    }
+}
+
 fn raw(bytes: &[u8]) -> Evidence {
     Evidence {
         kind: RepresentationKind::HttpEntity,
@@ -1400,7 +1426,7 @@ mod tests {
         private.url = "http://127.0.0.1/private".into();
         for (input, expected) in [
             (private, ErrorCode::DestinationDenied),
-            (browser_input("/private"), ErrorCode::PolicyDenied),
+            (browser_input("/private"), ErrorCode::BrowserRobotsDenied),
             (browser_input("/redirect"), ErrorCode::DestinationDenied),
         ] {
             assert_eq!(

@@ -419,6 +419,7 @@ pkgs.testers.runNixOSTest {
         # D2: derive a coherent profile from the synthetic observed region.
         # The neutral policy is covered by the browser::profile unit tests.
         browser.profile = "exit_region";
+        searchOrder = [ "brave" ];
         providers.brave = {
           enable = true;
           capabilities = [ "search" ];

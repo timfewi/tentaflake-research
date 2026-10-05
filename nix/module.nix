@@ -349,7 +349,8 @@ in
           "searxng"
         ]
       );
-      default = if cfg.searxng.enable then [ "searxng" ] else [ "brave" ];
+      default = if cfg.searxng.enable then [ "searxng" ] else [ ];
+      description = "Explicit search adapter preference; empty disables search. Enabling the local SearXNG service selects its adapter by default.";
     };
     scrapeOrder = mkOption {
       type = types.listOf (

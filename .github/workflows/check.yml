@@ -6,7 +6,34 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+# Superseded PR checks stop; main-branch runs retain their release evidence.
+concurrency:
+  group: research-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  client:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+        with:
+          use-flakehub: false
+      - name: Select external Cargo target directory
+        run: printf 'CARGO_TARGET_DIR=%s/research-client-target\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ runner.os }}-research-client-${{ hashFiles('flake.lock', 'Cargo.lock', 'Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-research-client-${{ hashFiles('flake.lock', 'Cargo.lock', 'Cargo.toml') }}-
+      - name: Fetch locked Cargo dependencies
+        run: nix develop --command cargo fetch --locked
+      - name: Client checks
+        run: nix develop --command bash scripts/check client
   source:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -18,6 +45,14 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
         with:
           use-flakehub: false
+      - name: Select external Cargo target directory
+        run: printf 'CARGO_TARGET_DIR=%s/research-service-target\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ runner.os }}-research-service-${{ hashFiles('flake.lock', 'Cargo.lock', 'Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-research-service-${{ hashFiles('flake.lock', 'Cargo.lock', 'Cargo.toml') }}-
       - name: Fetch locked Cargo dependencies
         run: nix develop --command cargo fetch --locked
       - name: Source checks

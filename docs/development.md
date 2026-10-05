@@ -11,9 +11,33 @@ nix develop --command cargo test --locked --offline --test service_rpc
 ```
 
 The fast gate runs Rust formatting, all-target/all-feature Clippy with warnings
-denied, default-feature tests, Nix lints/formatting and ShellCheck. OS fixtures are
+denied, client-only and default-feature tests, Nix lints/formatting and ShellCheck.
+It evaluates the independent client package and rejects service libraries in its
+normal Cargo dependency graph. OS fixtures are
 compiled but need their own runtime checks. `project-check full` builds the three
 Rust package outputs and configuration checks; it does not run every VM.
+
+CI reports the small client separately from service checks and package checks.
+Cargo target caches are outside the source tree and keyed by the locked toolchain
+and manifests; client and service caches are separate. Superseded PR runs are
+cancelled. No builder or cache account is required by the runtime. An optional
+remote Nix builder (including nixbuild.net) can build packages, but VM fixtures
+also need compatible runtime/KVM support; voucher CPU-hours are not runner hours.
+
+Check or build only the socket clients with:
+
+```sh
+bash scripts/check client
+cargo build --locked --offline --no-default-features --bin research-client --bin research-curl
+```
+
+Use the pinned shell for this command. The default `service` Cargo feature keeps
+the existing service, egress and worker build. Shared request types and protocol
+remain provider-independent; the normal client graph has no Chromium, HTTP/TLS,
+DNS, HTML extraction or SQLite libraries. Client package sources exclude
+service/provider implementation files, so changes confined to those files do
+not invalidate the client package. Fetching sources still uses the shared lockfile.
+Use `path:.` when evaluating a working tree containing new, unstaged Nix files.
 
 ```sh
 nix build --no-link .#research-service .#research-client .#research-egress
@@ -37,6 +61,15 @@ nix build -L --no-link .#checks.x86_64-linux.parser-credentials-vm
 Browser/parser process fixtures in `scripts/check` require the pinned executable
 paths and an exact closure file. See [browser-validation.md](browser-validation.md).
 Missing isolation prerequisites fail the fixture; do not disable isolation.
+
+The service package source (`nix/source.nix`) admits only regular `.rs` files
+under `src` and `tests`, `Cargo.toml`, `Cargo.lock` and the embedded
+`src/browser/read.js`. It excludes `tests/nix`, hidden paths, build/cache/result
+directories, symlinks and special files, so local state such as credentials or
+caches under `src` never enters the Nix store, and it rejects required inputs
+supplied through symlinks. Declare any new non-Rust package input in
+`nix/source.nix`. `tests/source-inputs.sh` checks this with synthetic files and
+runs in `project-check fast`. The client package keeps its explicit file list.
 
 Keep documentation-only files outside the Rust package fileset. Before publication,
 review the selected Git diff, run a redacted secret scan and verify documentation

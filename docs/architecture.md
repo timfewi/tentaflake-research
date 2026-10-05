@@ -7,6 +7,13 @@ provides their identity, filesystem, network and resource boundaries. Consult
 
 ## Authority and content
 
+The stdio client and service share request schemas and the versioned Unix
+protocol. Provider adapters and execution backends belong to the optional
+`service` Cargo feature; the standalone client is a transport adapter with no
+provider credentials or HTTP/browser stack. The public five-tool contract does
+not include domain-specific lead/contact enrichment. New adapters must retain
+explicit grants and the existing budget, evidence and protected-egress boundary.
+
 Only five research operations cross the agent socket. A source URL, title,
 snippet, HTML node or PDF string never becomes executable configuration, a file
 path, credential name, shell command or additional capability. Machine failures
@@ -136,8 +143,11 @@ usable. This closes a reproduced regular-file write outside supervised scratch.
 It is not proof of the aggregate 512 MiB cap: the deployment mount, cgroups and
 adversarial nested namespace/mount behavior still require their own checks.
 
-HTML extraction preserves text-node Unicode. Optional Readability text gets
-its own representation/version. A first isolated Poppler inspection returns the
+HTML extraction preserves every Unicode scalar of the visible text nodes but
+normalizes layout whitespace and separates blocks (`research-html/v3`,
+`formatted-text`; `<pre>` stays verbatim). Optional Readability text uses the
+same formatting and has its own representation/version. The raw HTTP entity
+keeps the exact source whitespace. A first isolated Poppler inspection returns the
 page count; an atomic page reservation precedes the text-extraction worker. Poppler returns
 page-separated text; encrypted, empty-text, corrupt and excessive-page documents
 have explicit outcomes. When every page is empty, an operator-enabled OCR phase

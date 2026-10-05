@@ -51,6 +51,9 @@ pub enum SourceWarning {
     StorageNotPermitted,
     PartialExtraction,
     JavascriptRequired,
+    PageShell,
+    StreamingHtmlRecovered,
+    ReadabilityUnavailable,
     EgressInterrupted,
 }
 

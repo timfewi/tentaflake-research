@@ -5,6 +5,11 @@ An isolated public research service for AI agents, extracted from the MIT-licens
 retrieval, browser reading and saved evidence. Model requests stay with the
 agent's separate LLM broker.
 
+The five-tool interface stays provider-independent: search and scrape adapters
+are optional operator-granted integrations, and retrieval does not require a
+model provider. Domain-specific lead/contact workflows are outside this
+infrastructure contract.
+
 **Experimental.** This is security-sensitive software, not a claim of complete
 isolation or prompt-injection protection. See [SECURITY.md](SECURITY.md) for the
 threat model and [verification](docs/verification.md) for current evidence.
@@ -56,6 +61,12 @@ This server exposes five operations: `research_job`, `research_search`,
 policy boundary. See [the API](docs/api.md). The client package also provides
 GET-only `research-curl`, which uses the same socket and policy.
 
+`research-client` is an independent, small package: it builds without service,
+browser, HTTP/TLS, DNS, HTML-parser or SQLite dependencies. Both client binaries
+retain the same five-tool protocol and Unix-socket transport. The service and
+egress packages keep their existing outputs; real Research VM tests still need
+the full service build.
+
 Disable native web search, HTTP fetch and browser tools in the agent. Independently
 deny direct IP egress and other network-capable MCP servers; a tool setting alone
 does not restrict shell networking. Tentaflake's internal agent networks permit
@@ -64,7 +75,8 @@ general proxy or access to provider credentials.
 
 Paid search/scrape providers, OCR, Chromium and optional summarization require
 explicit operator configuration. Fetching and evidence reads do not require an
-LLM. [Providers](docs/providers.md) documents data grants and costs. The default
+LLM. No commercial provider is selected by default; inspect configured optional
+adapters with `research_job` operation `providers`. [Providers](docs/providers.md) documents data grants and costs. The default
 Tentaflake integration leaves research summarization disabled.
 
 ## Develop

@@ -4,9 +4,10 @@
 VPN/firewall adapter into short research-specific leases. It is included in the
 `research-egress` package output. The controller is implemented, and a reference
 `research-vpn-observer` producer is implemented but **disabled by default** (the
-operator may supply their own adapter). Host activation, NixOS unit acceptance and
-packet-level acceptance are still pending. Do not activate it on the host as part
-of source development.
+operator may supply their own adapter). NixOS units and synthetic WireGuard VM
+fixtures exist; their recorded checkpoints are in [verification.md](verification.md).
+Production host activation and the operator's actual VPN/firewall acceptance
+remain separate. Do not activate a host as part of source development.
 
 ## Trust and adapter contract
 
@@ -101,7 +102,7 @@ operator assertion, not as observed exit identity.
 
 ## Controller lifecycle
 
-The future unit invokes, with directories created securely by the module:
+The NixOS controller unit invokes, with directories created securely by the module:
 
 ```text
 research-egress-control --input /run/research-vpn/observation.json \

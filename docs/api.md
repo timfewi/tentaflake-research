@@ -20,7 +20,7 @@ service-authored categorical fields and never include tool input or source data.
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
-| `research_job` | `operation`: `start`, `status`, `finish`, `cancel`; `job_id` except for start; optional reduced `limits` on start | Job state, limits, usage, remaining budgets, granted capabilities and available source IDs |
+| `research_job` | `operation`: `providers`, `start`, `status`, `finish`, `cancel`; `job_id` for status/finish/cancel; optional reduced `limits` on start | Job state, limits, usage, remaining budgets, granted capabilities and available source IDs |
 | `research_search` | `job_id`, `queries`: objects with `q`, optional `count`, `language`, `country`, `freshness` | Per-query state, snippets, source, provider, cache hit, coverage and usage |
 | `research_fetch` | `job_id`, `urls`, optional `mode`: `auto`, `http`, `browser`, `provider`; optional `crawl` (`pages`, `depth`) with `http`/`auto` | Per-URL state, source, raw-source ID, link preview, complete links representation, extraction error, JavaScript need and an optional bounded-crawl summary |
 | `research_browser` | `action`: `open`, `read`, `follow_link`, `expand`, `scroll`, `close`, with job/session/versioned reference as applicable | Session ID, observed page/references, DOM and text sources, cumulative HTTP receipts, partial/error state |
@@ -53,6 +53,19 @@ UTC-day spending cap. Search attempts consume query slots; summaries consume
 requests, bytes, time and money without consuming extra search slots. Cache hits
 do not incur another upstream charge.
 
+A rejected numeric limit retains `error: "invalid_request"` and includes
+`details.reason: "job_limits"` with all `violations` (typed `field`, `requested`,
+`minimum`, `maximum`). Defaults allow 1–300 seconds; operator configuration can
+lower the ceiling. Zero remains valid for the other resources. Validation neither
+clamps job limits nor creates a job on rejection. Malformed or unknown fields can
+still return a plain `invalid_request`.
+
+`{"operation":"providers"}` returns the same effective `capabilities` before a
+job is started. It allocates no job, consumes no job budget and makes no network
+requests, so it remains available when egress is offline or job capacity is full.
+Unix peer authorization still applies. This reports operator configuration, not
+live provider reachability or tariffs.
+
 Top-level `capabilities` lists installed adapters with effective operator grants,
 filtered by privacy, under `search`, `scrape` and `summarize`.
 Each entry has `provider`, `request_micro_usd` (the configured reservation ceiling,
@@ -81,6 +94,13 @@ keeps fragments so hash-based pages remain addressable.
 is rendered when the operator has explicitly enabled and configured the browser.
 HTTP policy, access or extraction errors never trigger rendering. Without an
 enabled browser, the HTTP result retains its `javascript_required` flag.
+A long navigation/footer does not make an empty application shell readable:
+`page_shell` marks partial evidence. Paired static React streaming payloads can
+be recovered as derived text and links without executing scripts; they carry
+`streaming_html_recovered` and remain partial because the browser placement was
+not observed. Raw HTML is retained separately. `readability_unavailable` means
+the optional main-content projection failed; it does not make preserved full
+text incomplete by itself.
 
 `browser` uses a one-shot reading session. Its result includes `closed: true`;
 the returned session ID cannot be used for further actions. Browser work within a
@@ -107,6 +127,9 @@ clamped down to the operator's `limits.crawl_pages` (default 16, maximum 64) and
 values outside the API range are rejected. Crawling is single-origin per call:
 multiple seed URLs are crawled independently and links never cross an origin
 boundary.
+
+The crawl tracks both requested and final redirect URLs before following links,
+so a self-link to an already fetched redirect destination is not requested again.
 
 Every crawled page runs the normal fetch path, so redirects, retries, robots,
 cache, budgets and immutable evidence match a directly requested fetch, and each
@@ -238,3 +261,22 @@ The initial `hello` confirms version 1 and the exact tool set. IDs increase on
 each connection; responses may finish out of order. There are at most 16 active
 calls per connection and 32 connections. A partial frame body times out after
 30 seconds. Authentication is by Unix peer credentials, not agent-supplied IDs.
+
+Detailed tool failures use the existing v1 JSON value envelope reserved for an
+object with exactly `error` and `details`. The bridge recognizes it as a failure;
+the MCP adapter emits `isError: true`, and the ordinary bridge API still returns
+the original error code. Update client and service together: an older adapter
+cannot interpret the richer failure envelope. Ordinary failures retain the
+existing `Outcome::Error` frame. Successful browser results containing an
+`error: null` or retained partial evidence are not failure envelopes.
+
+Browser denials retain `policy_denied` at the tool boundary and can include
+`details.reason` of `robots_disallowed`, `browser_identity_mismatch`, or
+`browser_request_not_granted`. Browser-mode batch failures put the reason in
+`data.error_details`. These categories disclose no header values, secrets, paths
+or policy recipes. Other policy denials can still lack a more specific reason.
+When `auto` rendering fails, the HTTP evidence remains the primary partial result;
+`render_error` retains the canonical code and `render_error_details` includes a
+safe reason when available. An installed browser capability does not grant
+arbitrary methods, destinations or operations; a denial never authorizes another
+route.

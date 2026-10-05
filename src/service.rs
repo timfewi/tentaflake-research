@@ -205,6 +205,27 @@ pub struct Dependencies {
 }
 
 impl Service {
+    /// Called by the authenticated RPC layer after a failure. Only typed input
+    /// limits and fixed service-authored reason codes enter this diagnostic.
+    pub fn failure(
+        &self,
+        tool: Tool,
+        arguments: &Value,
+        code: ErrorCode,
+    ) -> crate::error::ToolFailure {
+        let mut failure = crate::error::ToolFailure::from(code);
+        if code == ErrorCode::InvalidRequest
+            && tool == Tool::ResearchJob
+            && let Ok(JobArgs::Start { limits }) = parse(arguments.clone())
+        {
+            let violations = limits.violations(&self.config.limits);
+            if !violations.is_empty() {
+                failure.details = Some(crate::error::ErrorDetails::JobLimits { violations });
+            }
+        }
+        failure
+    }
+
     pub fn new(config: Config, dependencies: Dependencies) -> Result<Arc<Self>> {
         config.validate()?;
         let Dependencies {
@@ -568,6 +589,9 @@ impl Service {
             Tool::ResearchJob => {
                 let args: JobArgs = parse(arguments)?;
                 let (job, include_sources) = match args {
+                    JobArgs::Providers {} => {
+                        return Ok(json!({"capabilities": self.capabilities(), "untrusted": true}));
+                    }
                     JobArgs::Start { limits } => (self.start(owner, connection, limits)?, false),
                     JobArgs::Status { job_id } => (self.ledger.get(owner, job_id)?, true),
                     JobArgs::Finish { job_id } => (
@@ -873,8 +897,14 @@ impl Service {
         // the seed origin.
         let crawl_summary = match crawl {
             Some(crawl) => Some(
-                self.crawl_seed(context, &target, &record.links, crawl)
-                    .await,
+                self.crawl_seed(
+                    context,
+                    &target,
+                    &record.source.final_url,
+                    &record.links,
+                    crawl,
+                )
+                .await,
             ),
             None => None,
         };
@@ -898,6 +928,8 @@ impl Service {
                         SourceWarning::PartialExtraction
                             | SourceWarning::Truncated
                             | SourceWarning::JavascriptRequired
+                            | SourceWarning::PageShell
+                            | SourceWarning::StreamingHtmlRecovered
                     )
                 }) {
                 ItemState::Partial
@@ -921,7 +953,9 @@ impl Service {
         {
             let mut rendered =
                 browser_item(index, self.render_fetch(context, &target, slots).await);
-            if let Some(data) = rendered.data.as_mut() {
+            if !matches!(rendered.state, ItemState::Failed)
+                && let Some(data) = rendered.data.as_mut()
+            {
                 data["http"] = item.data.take().expect("HTTP evidence was assembled above");
                 rendered
             } else {
@@ -929,6 +963,13 @@ impl Service {
                 item.error = rendered.error;
                 if let Some(data) = item.data.as_mut() {
                     data["render_error"] = json!(rendered.error);
+                    if let Some(details) = rendered
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("error_details"))
+                    {
+                        data["render_error_details"] = details.clone();
+                    }
                 }
                 item
             }
@@ -998,6 +1039,7 @@ impl Service {
         &self,
         context: &Context,
         seed: &PublicUrl,
+        seed_final_url: &str,
         seed_links: &[crate::worker::Link],
         crawl: CrawlArgs,
     ) -> Value {
@@ -1009,6 +1051,9 @@ impl Service {
         let max_depth = u32::from(crawl.depth).min(self.config.limits.crawl_depth);
         let mut visited: HashSet<String> = HashSet::new();
         visited.insert(seed.request_url().to_string());
+        if let Ok(final_url) = PublicUrl::parse(seed_final_url) {
+            visited.insert(final_url.request_url().to_string());
+        }
         let mut queue: VecDeque<(PublicUrl, u32)> = VecDeque::new();
         if max_depth >= 1 {
             for link in seed_links {
@@ -1082,6 +1127,9 @@ impl Service {
                         }
                     };
                     fetched += 1;
+                    if let Ok(final_url) = PublicUrl::parse(&record.source.final_url) {
+                        visited.insert(final_url.request_url().to_string());
+                    }
                     if record.error.is_some() {
                         partial = true;
                     }
@@ -1671,6 +1719,8 @@ fn crawl_page_data(depth: u32, record: &FetchRecord) -> Value {
                 SourceWarning::PartialExtraction
                     | SourceWarning::Truncated
                     | SourceWarning::JavascriptRequired
+                    | SourceWarning::PageShell
+                    | SourceWarning::StreamingHtmlRecovered
             )
         }) {
         ItemState::Partial
@@ -1696,7 +1746,14 @@ fn crawl_page_data(depth: u32, record: &FetchRecord) -> Value {
 fn browser_item(index: usize, result: Result<Value>) -> Item {
     let mut data = match result {
         Ok(data) => data,
-        Err(error) => return Item::failed(index, error),
+        Err(error) => {
+            let failure = crate::error::ToolFailure::from(error);
+            let mut item = Item::failed(index, failure.code);
+            if let Some(details) = failure.details {
+                item.data = Some(json!({"error_details": details}));
+            }
+            return item;
+        }
     };
     let error = match serde_json::from_value::<Option<ErrorCode>>(data["error"].clone()) {
         Ok(error) => error,

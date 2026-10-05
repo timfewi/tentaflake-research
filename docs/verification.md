@@ -53,3 +53,86 @@ real service SIGKILL followed by a successful new call from the same stdio
 process (4.39 seconds). The other five VM fixtures retain their baseline
 results and were not rerun for this change. The current-source redacted
 Gitleaks directory scan found no leaks; the Cargo lockfile is unchanged.
+
+
+## Provider-independent client and extraction follow-up (2026-10-03)
+
+Requirement: retain the public five-tool, per-UID/no-replay boundary while making
+client builds independent, improving generic fetching and keeping provider
+selection optional. No domain-specific enrichment interface is added.
+
+Changed areas: `Cargo.toml`, shared API/protocol DTOs and feature gates;
+`nix/package.nix`, flake apps and client packaging checks; synthetic client
+process tests and the dependency guard; HTML worker/extraction warning mapping,
+redirect-aware crawl visitation; neutral provider defaults and read-only
+`research_job` operation `providers`; CI client feedback, Cargo caches and docs.
+The controller, observer, egress firewall and public bridge recovery code are
+unchanged. `UPSTREAM.md` records the selected source provenance.
+
+Before fixing extraction, the new service regressions failed: a long-navigation
+application shell had no JavaScript hint, and a redirected seed was fetched
+again, exhausting the 16-request budget before the final discovered page. After
+the fixes, both regressions pass; the crawl records one seed-destination fetch,
+three discovered pages and 14 charged requests. Streamed content is derived
+partial evidence, never observed browser placement, and no script is executed.
+
+Current-source evidence:
+
+- `project-check fast`: passed. Client-only checks run without service features;
+  default-feature tests include 211 library tests and 58 service RPC tests.
+  The existing reconnect, cancellation, ownership and conservative provider
+  fallback regressions still pass. New provider inspection tests prove offline
+  availability with full job capacity, authorization, no network or charges,
+  secret-free output and strict-privacy filtering.
+- Focused Nix builds of `research-client`, `checks.x86_64-linux.module` and
+  `checks.x86_64-linux.parser-tools`: passed. The actual narrow client source
+  package builds and tests its two binaries without service dependencies.
+- `scripts/check worker-isolation`: passed using the pinned Bubblewrap/Poppler
+  paths and parser closure. Actual isolated worker coverage includes streamed
+  Unicode, hidden-content exclusion, shell/challenge handling, HTML/PDF/OCR,
+  private mount/network namespaces, credential isolation and abort/timeout cleanup.
+- `actionlint` 1.7.12: passed on the updated workflow. GitHub execution and a
+  measured CI speedup remain unverified.
+
+Full service package rebuilds, browser/runtime VM suites, production VPN checks,
+paid provider calls and host activation were not run for this follow-up. Existing
+VM evidence above remains historical. The standard fast gate's generic Semgrep
+baseline scanned no Rust files and is not Rust security evidence.
+
+Publication checkpoint: the DCO-signed source is pushed for review in
+[PR #3](https://github.com/timfewi/tentaflake-research/pull/3). The staged redacted
+Gitleaks scan passed. After upstream review/merge, the consuming input update and
+affected deployment fixtures are tracked in
+[Tentaflake issue #110](https://github.com/timfewi/tentaflake/issues/110).
+Provider-independent VPN adapter acceptance remains separate in
+[issue #4](https://github.com/timfewi/tentaflake-research/issues/4).
+The template still pins its previously published Research revision; no lockfile,
+private runtime catalogue, host state or real credential was copied.
+
+## Formatted text, package sources and failure details (2026-10-05)
+
+Source changes: HTML text uses normalized, block-separated formatted text
+(`research-html/v3`), the service package source admits only declared files
+(`nix/source.nix`), invalid job limits and browser denials return typed reasons
+over the existing v1 envelope, and RPC fixture sockets stay within the Unix
+address limit. The reconnect/no-replay bridge path is unchanged; the new
+`call_detailed` wraps it, and `call` keeps returning the plain error code.
+Client and service must be updated together to see detailed failures.
+
+Evidence for this source checkpoint (pinned shell, offline):
+
+- `cargo fmt`, `scripts/check client` (dependency guard, Clippy, client tests),
+  all-target/all-feature Clippy with warnings denied and the default-feature
+  tests passed, including the MCP invalid-limit regression, the short-socket
+  regression and the existing reconnect/ownership tests. `deadnix`, `statix`,
+  `nixfmt`, `shellcheck`, `tests/source-inputs.sh` and the client package
+  evaluation passed. A negative control (hidden paths no longer skipped) made the
+  source-input test fail.
+- `scripts/check browser-isolation` and `scripts/check worker-isolation`:
+  passed with the pinned Bubblewrap, Chromium, fontconfig and parser closures.
+  The browser service fixture covers the robots denial reason and the retained
+  `render_error_details`.
+
+Not run: package builds, VM suites, live provider or browser requests against
+real sites, and host activation. The new text format was verified on synthetic
+HTML only.

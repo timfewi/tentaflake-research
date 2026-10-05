@@ -323,6 +323,8 @@ impl Manager {
                     warning,
                     crate::archive::SourceWarning::PartialExtraction
                         | crate::archive::SourceWarning::Truncated
+                        | crate::archive::SourceWarning::PageShell
+                        | crate::archive::SourceWarning::StreamingHtmlRecovered
                 )
             });
         let links: Vec<_> = rendered

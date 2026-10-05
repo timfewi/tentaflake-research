@@ -113,6 +113,7 @@ pkgs.testers.runNixOSTest {
       clients.fixture = 4100;
       vpnInterface = "fixture-vpn";
       resolvers = [ "9.9.9.9" ];
+      searchOrder = pkgs.lib.optionals withCredentials [ "brave" ];
       providers = pkgs.lib.optionalAttrs withCredentials {
         brave = {
           enable = true;

@@ -153,6 +153,69 @@ async fn check() {
     assert!(parsed.pages[0].contains("Exact e\u{0301} 👩‍🔬 quote."));
     assert_eq!(parsed.title, "Fixture");
 
+    let streamed = r#"<main><template id="B:0"></template></main><div hidden id="S:0"><p>Streamed é 👩‍🔬 quote.</p><a href="/model">Model</a></div><div hidden>Hidden canary</div><script>$RC("B:0","S:0");throw new Error('must not run')</script>"#;
+    let parsed = extract(
+        &config,
+        root.path(),
+        streamed.as_bytes(),
+        DocumentKind::Html,
+        &base,
+        1,
+        &stop,
+    )
+    .await
+    .unwrap();
+    assert!(parsed.pages[0].contains("Streamed é 👩‍🔬 quote."));
+    assert!(!parsed.pages[0].contains("Hidden canary"));
+    assert!(
+        parsed
+            .warnings
+            .contains(&worker::ExtractionWarning::StreamingHtmlRecovered)
+    );
+    let shell = format!(
+        "<nav>{}</nav><main></main><footer>{}</footer><script src='/app.js'></script>",
+        "Navigation ".repeat(50),
+        "Footer ".repeat(50)
+    );
+    let parsed = extract(
+        &config,
+        root.path(),
+        shell.as_bytes(),
+        DocumentKind::Html,
+        &base,
+        1,
+        &stop,
+    )
+    .await
+    .unwrap();
+    assert!(
+        parsed
+            .warnings
+            .contains(&worker::ExtractionWarning::PageShell)
+    );
+    assert!(
+        parsed
+            .warnings
+            .contains(&worker::ExtractionWarning::JavascriptRequired)
+    );
+    let challenge = format!(
+        "<nav>{}</nav><main><div data-sitekey='captcha'>Verify you are human</div></main><script src='/challenge.js'></script>",
+        "Navigation ".repeat(50)
+    );
+    assert!(matches!(
+        extract(
+            &config,
+            root.path(),
+            challenge.as_bytes(),
+            DocumentKind::Html,
+            &base,
+            1,
+            &stop
+        )
+        .await,
+        Err(ErrorCode::AccessBlocked)
+    ));
+
     let pdf = pdf_fixture();
     let info = worker::inspect_pdf(
         &config,

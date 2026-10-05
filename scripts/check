@@ -4,12 +4,19 @@ set -euo pipefail
 case "${1:-fast}" in
   fast)
     cargo fmt --all -- --check
-    cargo clippy --offline --all-targets --all-features -- -D warnings
-    cargo test --offline --all-targets
+    bash scripts/check client
+    cargo clippy --locked --offline --all-targets --all-features -- -D warnings
+    cargo test --locked --offline --all-targets
     deadnix --fail .
     statix check .
     nixfmt --check flake.nix nix/*.nix tests/nix/*.nix
-    shellcheck scripts/check
+    shellcheck scripts/check tests/*.sh
+    ;;
+  client)
+    cargo fmt --all -- --check
+    bash tests/client-dependencies.sh
+    cargo clippy --locked --offline --no-default-features --all-targets -- -D warnings
+    cargo test --locked --offline --no-default-features --all-targets
     ;;
   nixos-config)
     : "${RESEARCH_TEST_NIXOS_CONFIG:?set the built NixOS module check output}"
@@ -64,7 +71,7 @@ case "${1:-fast}" in
     cargo test --offline --features activation-tests --test service-activation
     ;;
   *)
-    echo 'usage: bash scripts/check [fast|nixos-config|egress-control|vpn-observer|worker-isolation|browser-isolation|service-activation]' >&2
+    echo 'usage: bash scripts/check [fast|client|nixos-config|egress-control|vpn-observer|worker-isolation|browser-isolation|service-activation]' >&2
     exit 2
     ;;
 esac
