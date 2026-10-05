@@ -44,4 +44,6 @@ pub mod vpn_evidence;
 #[cfg(feature = "service")]
 pub mod vpn_observer;
 #[cfg(feature = "service")]
+pub mod wireguard_evidence;
+#[cfg(feature = "service")]
 pub mod worker;

@@ -6,9 +6,10 @@ use secure_research::vpn_evidence::{
     AF_INET, AF_INET6,
     synthetic::{RouteSpec, RuleSpec, dump, route, rule},
 };
+use secure_research::wireguard_evidence::synthetic::{device_dump, peer};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 fn required(name: &str) -> PathBuf {
@@ -150,14 +151,14 @@ fn write_layout(v4_rule: bool, v6_rule: bool, dns_leak: bool) {
             RuleSpec::lookup(family, 32767, 253),
             RuleSpec {
                 suppress_prefix_len: Some(0),
-                ..RuleSpec::lookup(family, 32765, 254)
+                ..RuleSpec::lookup(family, 32764, 254)
             },
         ];
         if tunnel_rule {
             family_rules.push(RuleSpec {
                 invert: true,
                 mark: Some((0xca6c, u32::MAX)),
-                ..RuleSpec::lookup(family, 32764, 51820)
+                ..RuleSpec::lookup(family, 32765, 51820)
             });
         }
         rules.extend(dump(&family_rules.iter().map(rule).collect::<Vec<_>>()));
@@ -176,10 +177,45 @@ fn write_uevent(sysfs: &Path, interface: &str, devtype: &str) {
     .unwrap();
 }
 
+const WIREGUARD_FAMILY: u16 = 33;
+/// The pinned exit's public key (not a secret) and another peer's.
+const EXIT_KEY: [u8; 32] = [7; 32];
+const OTHER_KEY: [u8; 32] = [9; 32];
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// A synthetic WireGuard device dump (which also carries private and preshared key
+/// patterns the observer must never keep): the given peers, each with the age of
+/// its last handshake in seconds.
+fn write_peers(peers: &[([u8; 32], Option<i64>)]) {
+    let now = unix_now();
+    let elements: Vec<Vec<u8>> = peers
+        .iter()
+        .map(|(key, age)| peer(*key, age.map(|age| now - age)))
+        .collect();
+    write_atomic(
+        "/input/wireguard.dump",
+        device_dump(WIREGUARD_FAMILY, &elements),
+    );
+}
+
+fn exit_key_text() -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(EXIT_KEY)
+}
+
 fn selected_evidence_observer() -> Command {
     let mut command = observer("DE");
     command
         .args(["--link-kind", "wireguard", "--egress-uid", "2"])
+        .args(["--handshake-within", "60"])
+        .args(["--peer-public-key", &exit_key_text()])
+        .args(["--wireguard-dump", "/input/wireguard.dump"])
         .args(["--dns-resolver", "9.9.9.9", "--dns-resolver", "2620:fe::fe"])
         .args(["--rule-dump", "/input/rules.dump"])
         .args(["--drain-marker", "/input/drain"])
@@ -205,6 +241,7 @@ fn selected_evidence_check() {
     write_uevent(sysfs, "lo", "wireguard");
     write_layout(true, true, false);
     let _ = std::fs::remove_file("/input/drain");
+    write_peers(&[(EXIT_KEY, Some(5))]);
     let mut child = selected_evidence_observer().spawn().unwrap();
     // The previous (killed) observer's last Ready lease may still be on disk for
     // up to ten seconds; only this observer's own proof counts.
@@ -227,6 +264,23 @@ fn selected_evidence_check() {
     write_layout(true, true, true);
     wait_state(|state| state.mode == EgressMode::Offline);
     write_layout(true, true, false);
+    wait_state(|state| state.mode == EgressMode::Ready);
+    // A handshake older than the window means the tunnel may be dead.
+    write_peers(&[(EXIT_KEY, Some(120))]);
+    wait_state(|state| state.mode == EgressMode::Offline);
+    write_peers(&[(EXIT_KEY, Some(5))]);
+    wait_state(|state| state.mode == EgressMode::Ready);
+    // A different peer, or an extra one, is not the pinned exit.
+    write_peers(&[(OTHER_KEY, Some(5))]);
+    wait_state(|state| state.mode == EgressMode::Offline);
+    write_peers(&[(EXIT_KEY, Some(5)), (OTHER_KEY, Some(5))]);
+    wait_state(|state| state.mode == EgressMode::Offline);
+    write_peers(&[(EXIT_KEY, Some(5))]);
+    wait_state(|state| state.mode == EgressMode::Ready);
+    // A dump the observer cannot read is not evidence.
+    write_atomic("/input/wireguard.dump", b"junk".to_vec());
+    wait_state(|state| state.mode == EgressMode::Offline);
+    write_peers(&[(EXIT_KEY, Some(5))]);
     wait_state(|state| state.mode == EgressMode::Ready);
     // A device that merely has the interface's name is not a WireGuard tunnel.
     write_uevent(sysfs, "lo", "dummy");
@@ -268,6 +322,9 @@ fn selected_evidence_check() {
         "ipv6_path_not_contained",
         "dns_path_not_tunnel",
         "link_kind_mismatch",
+        "handshake_stale",
+        "peer_set_mismatch",
+        "peer_evidence_malformed",
         "rule_dump_malformed",
         "drain_marker_insecure",
     ] {
@@ -276,7 +333,15 @@ fn selected_evidence_check() {
             "{event}"
         );
     }
-    for secret in ["9.9.9.9", "2620", "/input", "wireguard", "dummy", "lo\""] {
+    for secret in [
+        "9.9.9.9",
+        "2620",
+        "/input",
+        "wireguard",
+        "dummy",
+        "lo\"",
+        &exit_key_text(),
+    ] {
         assert!(!diagnostics.contains(secret), "diagnostics leaked {secret}");
     }
     assert!(diagnostics.lines().all(|line| line.len() < 256));

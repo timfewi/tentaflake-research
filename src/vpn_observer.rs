@@ -24,6 +24,9 @@ pub struct Observation {
     /// Observed IPv4 tunnel path, IPv6 containment and resolver paths of the egress
     /// identity, when selected. `None` is not selected; `Some(false)` is offline.
     pub egress_paths: Option<bool>,
+    /// The WireGuard peers' identity and recent handshakes, when selected.
+    /// `None` is not selected; `Some(false)` is offline.
+    pub peers: Option<bool>,
     /// The operator requested a planned exit change (a root-controlled drain marker).
     pub draining: bool,
 }
@@ -38,6 +41,7 @@ impl Observation {
             region: None,
             link_kind: None,
             egress_paths: None,
+            peers: None,
             draining: false,
         }
     }
@@ -48,6 +52,7 @@ impl Observation {
             && self.firewall_marker
             && self.link_kind != Some(false)
             && self.egress_paths != Some(false)
+            && self.peers != Some(false)
             && valid_region(&self.region)
     }
 }
@@ -149,6 +154,7 @@ mod tests {
             region: region.map(str::to_owned),
             link_kind: None,
             egress_paths: None,
+            peers: None,
             draining: false,
         }
     }
@@ -284,6 +290,10 @@ mod tests {
                 egress_paths: Some(false),
                 ..ready(Some("DE"))
             },
+            Observation {
+                peers: Some(false),
+                ..ready(Some("DE"))
+            },
         ] {
             let state = Observer::new().update(&failed, 100);
             assert_eq!(state.mode, EgressMode::Offline);
@@ -292,6 +302,7 @@ mod tests {
         let held = Observation {
             link_kind: Some(true),
             egress_paths: Some(true),
+            peers: Some(true),
             ..ready(Some("DE"))
         };
         assert_eq!(Observer::new().update(&held, 100).mode, EgressMode::Ready);

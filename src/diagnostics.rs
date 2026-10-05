@@ -31,6 +31,10 @@ pub enum Event {
     FirewallMarkerInsecure,
     LinkKindUnreadable,
     LinkKindMismatch,
+    PeerEvidenceUnavailable,
+    PeerEvidenceMalformed,
+    PeerSetMismatch,
+    HandshakeStale,
     RuleDumpUnavailable,
     RuleDumpMalformed,
     Ipv4PathNotTunnel,
@@ -82,6 +86,10 @@ impl Event {
             | Self::FirewallMarkerInsecure
             | Self::LinkKindUnreadable
             | Self::LinkKindMismatch
+            | Self::PeerEvidenceUnavailable
+            | Self::PeerEvidenceMalformed
+            | Self::PeerSetMismatch
+            | Self::HandshakeStale
             | Self::RuleDumpUnavailable
             | Self::RuleDumpMalformed
             | Self::Ipv4PathNotTunnel

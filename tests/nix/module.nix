@@ -52,19 +52,22 @@ let
     vpnOuterMark = 21063;
     vpnOuterEndpoints = [ outerEndpoint ];
   };
-  observerService =
+  exitKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+  observerBase = {
+    enable = true;
+    firewallMarker = "/run/research-firewall/ready";
+  };
+  observerUnit =
     overrides:
-    (evaluate {
-      vpnObserver = {
-        enable = true;
-        firewallMarker = "/run/research-firewall/ready";
-      }
-      // overrides;
-    }).systemd.services.agent-research-vpn-observer.serviceConfig.ExecStart;
+    (evaluate { vpnObserver = observerBase // overrides; })
+    .systemd.services.agent-research-vpn-observer.serviceConfig;
+  observerService = overrides: (observerUnit overrides).ExecStart;
   defaultObserver = observerService { };
   selectedObserver = observerService {
     linkKind = "wireguard";
     egressPathEvidence = true;
+    handshakeWithinSeconds = 180;
+    peerPublicKeys = [ exitKey ];
     drainMarker = "/run/research-drain/marker";
   };
   logged = evaluate {
@@ -191,6 +194,8 @@ let
         "--link-kind"
         "--egress-uid"
         "--dns-resolver"
+        "--handshake-within"
+        "--peer-public-key"
         "--drain-marker"
       ];
       expected = false;
@@ -200,6 +205,8 @@ let
         "--link-kind wireguard"
         "--egress-uid 4202"
         "--dns-resolver 9.9.9.9"
+        "--handshake-within 180"
+        "--peer-public-key ${exitKey}"
         "--drain-marker /run/research-drain/marker"
       ];
       expected = true;
@@ -208,8 +215,43 @@ let
       expr = builtins.all rejected [
         { vpnObserver.linkKind = "wireguard"; }
         { vpnObserver.egressPathEvidence = true; }
+        { vpnObserver.handshakeWithinSeconds = 180; }
+        { vpnObserver.peerPublicKeys = [ exitKey ]; }
         { vpnObserver.drainMarker = "/run/research-drain/marker"; }
       ];
+      expected = true;
+    };
+    testPeerEvidenceRequiresAWireguardLink = {
+      expr = builtins.all (selection: rejected { vpnObserver = observerBase // selection; }) [
+        { handshakeWithinSeconds = 180; }
+        { peerPublicKeys = [ exitKey ]; }
+        {
+          linkKind = "tun";
+          handshakeWithinSeconds = 180;
+        }
+      ];
+      expected = true;
+    };
+    testPeerEvidenceNeedsExactlyTheNetworkAdministrationCapability = {
+      expr = [
+        (observerUnit { }).CapabilityBoundingSet
+        (observerUnit {
+          linkKind = "wireguard";
+          handshakeWithinSeconds = 180;
+        }).CapabilityBoundingSet
+      ];
+      expected = [
+        ""
+        [ "CAP_NET_ADMIN" ]
+      ];
+    };
+    testMoreThanFourPinnedPeersAreRejected = {
+      expr = rejected {
+        vpnObserver = observerBase // {
+          linkKind = "wireguard";
+          peerPublicKeys = builtins.genList (_: exitKey) 5;
+        };
+      };
       expected = true;
     };
     testDrainMarkerMustDifferFromTheFirewallMarker = {

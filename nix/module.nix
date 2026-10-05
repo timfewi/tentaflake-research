@@ -340,6 +340,16 @@ in
         description = "Require the VPN interface to be this kind of link (a WireGuard device or a layer-3 tun device such as Tailscale's). Not selected by default; no VPN vendor is required.";
       };
       egressPathEvidence = mkEnableOption "observation of the egress identity's paths: unmarked IPv4 traffic must use the tunnel, IPv6 must not leave through another interface and every configured resolver must be reached through the tunnel. Not selected by default; the baseline only needs a default route on the interface";
+      handshakeWithinSeconds = mkOption {
+        type = types.nullOr (types.ints.between 30 3600);
+        default = null;
+        description = "Require the WireGuard peers to have completed a handshake within this many seconds (use 180 or more: a session expires after 180 s and a keepalive tunnel re-handshakes about every two minutes). Read from the kernel's WireGuard netlink dump (public keys and handshake times only; secrets in the dump are never kept), which needs CAP_NET_ADMIN for the observer unit. Requires linkKind = \"wireguard\". Detection of a dead tunnel takes up to this window. Not selected by default.";
+      };
+      peerPublicKeys = mkOption {
+        type = types.listOf (types.strMatching "[A-Za-z0-9+/]{43}=");
+        default = [ ];
+        description = "Pin the exit's identity: the VPN interface's WireGuard peers must be exactly these public keys (base64, not secret; at most four). Requires linkKind = \"wireguard\". Needs CAP_NET_ADMIN for the observer unit. Not selected by default.";
+      };
       drainMarker = mkOption {
         type = types.nullOr runtimePath;
         default = null;
@@ -526,9 +536,21 @@ in
               || (
                 cfg.vpnObserver.linkKind == null
                 && !cfg.vpnObserver.egressPathEvidence
+                && cfg.vpnObserver.handshakeWithinSeconds == null
+                && cfg.vpnObserver.peerPublicKeys == [ ]
                 && cfg.vpnObserver.drainMarker == null
               );
-            message = "vpnObserver.linkKind, egressPathEvidence and drainMarker apply only with vpnObserver.enable.";
+            message = "vpnObserver.linkKind, egressPathEvidence, handshakeWithinSeconds, peerPublicKeys and drainMarker apply only with vpnObserver.enable.";
+          }
+          {
+            assertion =
+              (cfg.vpnObserver.handshakeWithinSeconds == null && cfg.vpnObserver.peerPublicKeys == [ ])
+              || cfg.vpnObserver.linkKind == "wireguard";
+            message = "vpnObserver.handshakeWithinSeconds and peerPublicKeys require vpnObserver.linkKind = \"wireguard\".";
+          }
+          {
+            assertion = builtins.length cfg.vpnObserver.peerPublicKeys <= 4;
+            message = "vpnObserver.peerPublicKeys allows at most four keys.";
           }
           {
             assertion =
@@ -792,6 +814,12 @@ in
           serviceConfig = common // {
             User = "root";
             Group = "root";
+            # The WireGuard netlink dump needs CAP_NET_ADMIN; nothing else does.
+            CapabilityBoundingSet =
+              if cfg.vpnObserver.handshakeWithinSeconds != null || cfg.vpnObserver.peerPublicKeys != [ ] then
+                [ "CAP_NET_ADMIN" ]
+              else
+                "";
             ExecStart =
               "${cfg.egressPackage}/bin/research-vpn-observer --interface ${interface} --output ${cfg.observationFile} --refresh-seconds ${toString cfg.vpnObserver.refreshSeconds} --firewall-marker ${cfg.vpnObserver.firewallMarker}"
               + lib.optionalString (cfg.vpnObserver.region != null) " --region ${cfg.vpnObserver.region}"
@@ -800,6 +828,10 @@ in
                 " --egress-uid ${toString egressUid}"
                 + lib.concatMapStrings (resolver: " --dns-resolver ${resolver}") cfg.resolvers
               )
+              + lib.optionalString (
+                cfg.vpnObserver.handshakeWithinSeconds != null
+              ) " --handshake-within ${toString cfg.vpnObserver.handshakeWithinSeconds}"
+              + lib.concatMapStrings (key: " --peer-public-key ${key}") cfg.vpnObserver.peerPublicKeys
               + lib.optionalString (
                 cfg.vpnObserver.drainMarker != null
               ) " --drain-marker ${cfg.vpnObserver.drainMarker}";

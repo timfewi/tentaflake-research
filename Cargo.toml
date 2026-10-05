@@ -15,6 +15,7 @@ service = [
     "dep:dom_query", "dep:encoding_rs", "dep:futures-util", "dep:hickory-resolver",
     "dep:http", "dep:httparse", "dep:listenfd", "dep:nix", "dep:reqwest",
     "dep:rusqlite", "dep:rustix", "dep:rustls", "dep:tempfile", "dep:webpki-roots",
+    "dep:zeroize",
     "schemars/chrono04", "tokio/rt-multi-thread", "tokio/process", "tokio/signal",
 ]
 isolation-tests = ["service"]
@@ -141,6 +142,7 @@ httparse = { version = "1", optional = true }
 ipnet = { version = "2", features = ["serde"] }
 listenfd = { version = "1", optional = true }
 nix = { version = "0.30", default-features = false, features = ["net"], optional = true }
+zeroize = { version = "1", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "stream", "json", "query", "gzip", "brotli", "deflate", "zstd"], optional = true }
 rmcp = { version = "=3.3.0", default-features = false, features = ["server", "macros", "schemars", "transport-io"] }
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }

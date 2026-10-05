@@ -5,12 +5,14 @@ use secure_research::vpn_evidence::{
     self as evidence, AF_INET, AF_INET6, MAX_DUMP_BYTES, RTM_GETROUTE, RTM_GETRULE, Route, Rule,
 };
 use secure_research::vpn_observer::{Observation, Observer};
+use secure_research::wireguard_evidence as wireguard;
 use secure_research::{diagnostics, diagnostics::Component, diagnostics::Event};
 use std::net::IpAddr;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 /// The tunnel implementation whose link kind is checked. Selecting one is an
 /// operator decision; no vendor is required.
@@ -54,6 +56,23 @@ struct Args {
     /// through the tunnel. Requires --egress-uid.
     #[arg(long = "dns-resolver", requires = "egress_uid", num_args = 1)]
     dns_resolvers: Vec<IpAddr>,
+    /// Require the WireGuard peers to have completed a handshake within this many
+    /// seconds, read from the kernel's WireGuard netlink dump (public keys and
+    /// handshake times only; secrets in the dump are never kept). A session expires
+    /// after 180 s and a keepalive tunnel re-handshakes about every two minutes, so
+    /// use 180 or more. Requires `--link-kind wireguard`. Not selected by default.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(30..=3600))]
+    handshake_within: Option<u64>,
+    /// Pin the exit's identity: the interface's WireGuard peers must be exactly
+    /// these base64 public keys (not secret; repeat for several, at most four).
+    /// Requires `--link-kind wireguard`. Not selected by default.
+    #[arg(long = "peer-public-key", value_parser = parse_public_key)]
+    peer_public_keys: Vec<[u8; 32]>,
+    /// Optional pre-recorded WireGuard netlink device dump, used only by the
+    /// synthetic namespace fixture. Omitted in deployment, where the observer
+    /// queries the kernel.
+    #[arg(long)]
+    wireguard_dump: Option<PathBuf>,
     /// A root-owned marker whose presence requests a planned exit change: the
     /// observer reports draining, and a fresh generation once it is removed.
     #[arg(long)]
@@ -80,7 +99,10 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
-    if args.dns_resolvers.len() > 4 {
+    if args.dns_resolvers.len() > 4
+        || args.peer_public_keys.len() > 4
+        || (peer_evidence_selected(&args) && !matches!(args.link_kind, Some(LinkKind::Wireguard)))
+    {
         return Err(ErrorCode::InvalidRequest);
     }
     if !rustix::process::geteuid().is_root() {
@@ -188,7 +210,102 @@ fn gather(args: &Args) -> Observation {
             .link_kind
             .map(|kind| link_kind(&args.sysfs, &args.interface, kind)),
         egress_paths,
+        peers: peer_evidence_selected(args).then(|| peer_evidence(args)),
         draining,
+    }
+}
+
+fn parse_public_key(text: &str) -> std::result::Result<[u8; 32], String> {
+    wireguard::decode_public_key(text)
+        .ok_or_else(|| "expected a base64 WireGuard public key".to_owned())
+}
+
+fn peer_evidence_selected(args: &Args) -> bool {
+    args.handshake_within.is_some() || !args.peer_public_keys.is_empty()
+}
+
+/// The WireGuard peers' identity and recent handshakes. The kernel's dump also
+/// carries the private key and preshared keys: only public keys and handshake
+/// times are parsed, and every buffer that held the dump is scrubbed.
+fn peer_evidence(args: &Args) -> bool {
+    let Some(dump) = wireguard_dump(args) else {
+        diagnostic(Event::PeerEvidenceUnavailable);
+        return false;
+    };
+    let Some(peers) = wireguard::parse_peers(&dump) else {
+        diagnostic(Event::PeerEvidenceMalformed);
+        return false;
+    };
+    drop(dump);
+    let now = chrono::Utc::now().timestamp();
+    let pins = &args.peer_public_keys;
+    let ok = wireguard::peers_ok(&peers, pins, args.handshake_within, now);
+    if !ok {
+        // Name the failed dimension without any key, address or time.
+        if !pins.is_empty() && !wireguard::peers_ok(&peers, pins, None, now) {
+            diagnostic(Event::PeerSetMismatch);
+        } else {
+            diagnostic(Event::HandshakeStale);
+        }
+    }
+    ok
+}
+
+/// A recorded dump (synthetic fixture) or a live generic-netlink query.
+fn wireguard_dump(args: &Args) -> Option<Zeroizing<Vec<u8>>> {
+    match args.wireguard_dump.as_deref() {
+        Some(path) => {
+            use std::io::Read;
+            let mut bytes = Zeroizing::new(Vec::with_capacity(wireguard::MAX_DUMP_BYTES));
+            std::fs::File::open(path)
+                .ok()?
+                .take(wireguard::MAX_DUMP_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            (bytes.len() <= wireguard::MAX_DUMP_BYTES).then_some(bytes)
+        }
+        None => live_wireguard_dump(&args.interface),
+    }
+}
+
+fn live_wireguard_dump(interface: &str) -> Option<Zeroizing<Vec<u8>>> {
+    use nix::sys::socket::{
+        AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, recv, sendto,
+        socket,
+    };
+    let socket = socket(
+        AddressFamily::Netlink,
+        SockType::Raw,
+        SockFlag::SOCK_CLOEXEC,
+        SockProtocol::NetlinkGeneric,
+    )
+    .ok()?;
+    let send = |request: &[u8]| {
+        sendto(
+            socket.as_raw_fd(),
+            request,
+            &NetlinkAddr::new(0, 0),
+            MsgFlags::empty(),
+        )
+        .ok()
+    };
+    send(&wireguard::family_request())?;
+    let mut reply = [0u8; 1024];
+    let received = recv(socket.as_raw_fd(), &mut reply, MsgFlags::empty()).ok()?;
+    let family = wireguard::parse_family_id(&reply[..received])?;
+    send(&wireguard::device_request(family, interface))?;
+    // Preallocated so the buffer never reallocates, and scrubbed on drop.
+    let mut dump = Zeroizing::new(Vec::with_capacity(wireguard::MAX_DUMP_BYTES));
+    let mut buffer = Zeroizing::new([0u8; 16 * 1024]);
+    loop {
+        let received = recv(socket.as_raw_fd(), &mut buffer[..], MsgFlags::empty()).ok()?;
+        if received == 0 || dump.len() + received > wireguard::MAX_DUMP_BYTES {
+            return None;
+        }
+        dump.extend_from_slice(&buffer[..received]);
+        if evidence::dump_complete(&dump) {
+            return Some(dump);
+        }
     }
 }
 
