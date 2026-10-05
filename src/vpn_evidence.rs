@@ -95,17 +95,17 @@ pub struct Rule {
     pub suppress_prefix_len: Option<u32>,
 }
 
-fn align4(length: usize) -> usize {
+pub(crate) fn align4(length: usize) -> usize {
     (length + 3) & !3
 }
 
-fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+pub(crate) fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_ne_bytes(
         bytes.get(offset..offset + 2)?.try_into().ok()?,
     ))
 }
 
-fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+pub(crate) fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_ne_bytes(
         bytes.get(offset..offset + 4)?.try_into().ok()?,
     ))
@@ -132,17 +132,23 @@ pub fn dump_complete(dump: &[u8]) -> bool {
     false
 }
 
-struct Message<'a> {
-    kind: u16,
-    payload: &'a [u8],
+pub(crate) struct Message<'a> {
+    pub(crate) kind: u16,
+    pub(crate) payload: &'a [u8],
 }
 
 /// Split one or several concatenated dumps into messages. Every dump must end
 /// with NLMSG_DONE; a truncated, unterminated or error-carrying dump is `None`.
 fn messages(dump: &[u8]) -> Option<Vec<Message<'_>>> {
+    collect(dump, true)
+}
+
+/// Like [`messages`]; a single reply to a non-dump request has no NLMSG_DONE, so
+/// `require_done` is false for it.
+pub(crate) fn collect(dump: &[u8], require_done: bool) -> Option<Vec<Message<'_>>> {
     let mut offset = 0;
+    let mut complete = !require_done;
     let mut found = Vec::new();
-    let mut complete = false;
     while offset < dump.len() {
         let length = read_u32(dump, offset)? as usize;
         if length < 16 || offset.checked_add(length)? > dump.len() {
@@ -158,7 +164,7 @@ fn messages(dump: &[u8]) -> Option<Vec<Message<'_>>> {
                 }
             }
             _ => {
-                complete = false;
+                complete = !require_done;
                 found.push(Message { kind, payload });
             }
         }
@@ -167,9 +173,11 @@ fn messages(dump: &[u8]) -> Option<Vec<Message<'_>>> {
     complete.then_some(found)
 }
 
-/// Netlink attributes following a fixed 12-byte header, or `None` when malformed.
-fn attributes(payload: &[u8]) -> Option<Vec<(u16, &[u8])>> {
-    let mut offset = 12;
+/// Netlink attributes following a fixed `header`-byte message header (12 for a
+/// route or rule, 4 for generic netlink, 0 for a nested list), or `None` when
+/// malformed.
+pub(crate) fn attributes(payload: &[u8], header: usize) -> Option<Vec<(u16, &[u8])>> {
+    let mut offset = header;
     let mut found = Vec::new();
     while offset + 4 <= payload.len() {
         let length = read_u16(payload, offset)? as usize;
@@ -218,7 +226,7 @@ pub fn parse_routes(dump: &[u8]) -> Option<Vec<Route>> {
             kind,
             output_index: None,
         };
-        for (attribute, value) in attributes(payload)? {
+        for (attribute, value) in attributes(payload, 12)? {
             match attribute {
                 RTA_DST => route.destination = Some(address(value, family)?),
                 RTA_OIF => route.output_index = Some(attribute_u32(value)?),
@@ -263,13 +271,17 @@ pub fn parse_rules(dump: &[u8]) -> Option<Vec<Rule>> {
             suppress_prefix_len: None,
         };
         let (mut mark, mut mask) = (None, None);
-        for (attribute, value) in attributes(payload)? {
+        for (attribute, value) in attributes(payload, 12)? {
             match attribute {
                 FRA_PRIORITY => rule.priority = attribute_u32(value)?,
                 FRA_TABLE => rule.table = attribute_u32(value)?,
                 FRA_FWMARK => mark = Some(attribute_u32(value)?),
                 FRA_FWMASK => mask = Some(attribute_u32(value)?),
-                FRA_SUPPRESS_PREFIXLEN => rule.suppress_prefix_len = Some(attribute_u32(value)?),
+                // The kernel reports "no suppression" as all ones (-1).
+                FRA_SUPPRESS_PREFIXLEN => {
+                    rule.suppress_prefix_len =
+                        Some(attribute_u32(value)?).filter(|limit| *limit != u32::MAX);
+                }
                 FRA_UID_RANGE if value.len() == 8 => {
                     rule.uid_range = Some((read_u32(value, 0)?, read_u32(value, 4)?));
                 }
@@ -721,18 +733,19 @@ mod tests {
         evaluate(routes, rules, family, uid, TUNNEL, destination)
     }
 
-    /// `wg-quick` layout: an unmarked-traffic rule to the tunnel table and a
-    /// suppressed main lookup, while the host keeps a direct main default.
+    /// `wg-quick` layout: a main lookup that suppresses default routes (32764)
+    /// ahead of the unmarked-traffic rule to the tunnel table (32765), while the
+    /// host keeps a direct main default.
     fn wireguard(family: u8) -> (Vec<RouteSpec>, Vec<RuleSpec>) {
         let mut rules = base(family);
         rules.push(RuleSpec {
             invert: true,
             mark: Some((0xca6c, u32::MAX)),
-            ..RuleSpec::lookup(family, 32764, 51820)
+            ..RuleSpec::lookup(family, 32765, 51820)
         });
         rules.push(RuleSpec {
             suppress_prefix_len: Some(0),
-            ..RuleSpec::lookup(family, 32765, 254)
+            ..RuleSpec::lookup(family, 32764, 254)
         });
         (
             vec![
@@ -759,7 +772,7 @@ mod tests {
     #[test]
     fn missing_tunnel_rule_exposes_the_direct_main_default() {
         let (route_specs, mut rule_specs) = wireguard(AF_INET);
-        rule_specs.retain(|rule| rule.priority != 32764);
+        rule_specs.retain(|rule| rule.priority != 32765);
         let (routes, rules) = (routes(&route_specs), rules(&rule_specs));
         let paths = path(&routes, &rules, AF_INET, EGRESS_UID, None);
         // The suppressed main lookup skips the default; the plain main rule finds it.
@@ -907,6 +920,46 @@ mod tests {
     }
 
     #[test]
+    fn a_resolver_on_a_connected_tunnel_network_is_found_in_main_ahead_of_the_tunnel_table() {
+        let resolver: IpAddr = "9.9.9.9".parse().unwrap();
+        let (mut route_specs, rule_specs) = wireguard(AF_INET);
+        // The tunnel's own address range is a connected route in the main table.
+        route_specs.push(RouteSpec::to(
+            AF_INET,
+            "9.9.9.0".parse().unwrap(),
+            24,
+            254,
+            TUNNEL,
+        ));
+        let rules = rules(&rule_specs);
+        let ok = path(
+            &routes(&route_specs),
+            &rules,
+            AF_INET,
+            EGRESS_UID,
+            Some(resolver),
+        );
+        assert!(ok.only_tunnel(), "{ok:?}");
+        // The same prefix on the physical link would be a leak found in main first.
+        route_specs.pop();
+        route_specs.push(RouteSpec::to(
+            AF_INET,
+            "9.9.9.0".parse().unwrap(),
+            24,
+            254,
+            ETH,
+        ));
+        let leak = path(
+            &routes(&route_specs),
+            &rules,
+            AF_INET,
+            EGRESS_UID,
+            Some(resolver),
+        );
+        assert!(leak.direct && !leak.only_tunnel(), "{leak:?}");
+    }
+
+    #[test]
     fn ipv6_resolver_prefixes_are_matched_bitwise() {
         let resolver: IpAddr = "2620:fe::fe".parse().unwrap();
         let specs = [
@@ -955,7 +1008,7 @@ mod tests {
         // IPv6 loses its tunnel rule: the physical IPv6 default is reachable, so
         // IPv6 and the IPv6 resolver leak while IPv4 stays in the tunnel.
         let mut leaking = rule_specs;
-        leaking.retain(|rule| !(rule.family == AF_INET6 && rule.priority == 32764));
+        leaking.retain(|rule| !(rule.family == AF_INET6 && rule.priority == 32765));
         let report = path_report(
             &parsed_routes,
             &rules(&leaking),
@@ -1088,5 +1141,125 @@ mod tests {
             ..rules(&[RuleSpec::lookup(AF_INET, 1, 1)])[0].clone()
         };
         assert!(matches(&foreign, 2) == Match::No);
+    }
+
+    /// Dumps recorded from a real kernel (6.18, little endian) in a private network
+    /// namespace with the layout of the VM test: interface indexes 2 (wg0, the
+    /// tunnel), 3 (eth2), 4 (eth0), `default via eth0` in main, `default dev wg0` in
+    /// table 51820 and the two `wg-quick` rules. The kernel reports "no
+    /// suppression" as `FRA_SUPPRESS_PREFIXLEN` = -1, which synthetic dumps never
+    /// showed and which once made every table lookup look suppressed.
+    #[cfg(target_endian = "little")]
+    mod recorded {
+        use super::*;
+
+        fn bytes(hex: &str) -> Vec<u8> {
+            (0..hex.len())
+                .step_by(2)
+                .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+                .collect()
+        }
+
+        fn dumps() -> (Vec<Route>, Vec<Rule>) {
+            let mut routes = bytes(ROUTES4);
+            routes.extend(bytes(ROUTES6));
+            let mut rules = bytes(RULES4);
+            rules.extend(bytes(RULES6));
+            (parse_routes(&routes).unwrap(), parse_rules(&rules).unwrap())
+        }
+
+        const RULES4: &str = concat!(
+            "3400000020000200010000000b990a0002000000ff0000010000000008000f00ff00000008000e00ffffffff05001500",
+            "020000003c00000020000200010000000b990a0002000000fe0000010000000008000f00fe00000008000e0000000000",
+            "050015000000000008000600fc7f00004c00000020000200010000000b990a0002000000fc0000010200000008000f00",
+            "6cca000008000e00ffffffff050015000000000008000600fd7f000008000a004752000008001000ffffffff3c000000",
+            "20000200010000000b990a0002000000fe0000010000000008000f00fe00000008000e00ffffffff0500150002000000",
+            "08000600fe7f00003c00000020000200010000000b990a0002000000fd0000010000000008000f00fd00000008000e00",
+            "ffffffff050015000200000008000600ff7f00001400000003000200010000000b990a0000000000",
+        );
+        const ROUTES4: &str = concat!(
+            "2c00000018000200010000000b990a0002000000fc03fd010000000008000f006cca0000080004000200000034000000",
+            "18000200010000000b990a0002000000fe0300010000000008000f00fe000000080005000a0002020800040004000000",
+            "3c00000018000200010000000b990a0002180000fe02fd010000000008000f00fe000000080001000909090008000700",
+            "0909090108000400020000003c00000018000200010000000b990a0002180000fe02fd010000000008000f00fe000000",
+            "080001000a000200080007000a00020f08000400040000003c00000018000200010000000b990a0002180000fe02fd01",
+            "0000000008000f00fe000000080001000a170000080007000a17000108000400020000003c0000001800020001000000",
+            "0b990a0002180000fe02fd010000000008000f00fe00000008000100c633640008000700c63364010800040003000000",
+            "3c00000018000200010000000b990a0002200000ff02fe020000000008000f00ff000000080001000909090108000700",
+            "0909090108000400020000003c00000018000200010000000b990a0002200000ff02fd030000000008000f00ff000000",
+            "08000100090909ff080007000909090108000400020000003c00000018000200010000000b990a0002200000ff02fe02",
+            "0000000008000f00ff000000080001000a00020f080007000a00020f08000400040000003c0000001800020001000000",
+            "0b990a0002200000ff02fd030000000008000f00ff000000080001000a0002ff080007000a00020f0800040004000000",
+            "3c00000018000200010000000b990a0002200000ff02fe020000000008000f00ff000000080001000a17000108000700",
+            "0a17000108000400020000003c00000018000200010000000b990a0002200000ff02fd030000000008000f00ff000000",
+            "080001000a1700ff080007000a17000108000400020000003c00000018000200010000000b990a0002080000ff02fe02",
+            "0000000008000f00ff000000080001007f000000080007007f00000108000400010000003c0000001800020001000000",
+            "0b990a0002200000ff02fe020000000008000f00ff000000080001007f000001080007007f0000010800040001000000",
+            "3c00000018000200010000000b990a0002200000ff02fd030000000008000f00ff000000080001007fffffff08000700",
+            "7f00000108000400010000003c00000018000200010000000b990a0002200000ff02fe020000000008000f00ff000000",
+            "08000100c633640108000700c633640108000400030000003c00000018000200010000000b990a0002200000ff02fd03",
+            "0000000008000f00ff00000008000100c63364ff08000700c63364010800040003000000140000000300020001000000",
+            "0b990a0000000000",
+        );
+        const RULES6: &str = concat!(
+            "3400000020000200010000000b990a000a000000ff0000010000000008000f00ff00000008000e00ffffffff05001500",
+            "020000003c00000020000200010000000b990a000a000000fe0000010000000008000f00fe00000008000e00ffffffff",
+            "050015000200000008000600fe7f00001400000003000200010000000b990a0000000000",
+        );
+        const ROUTES6: &str = concat!(
+            "7400000018000200010000000b990a000a400000fe0200010000000008000f00fe00000014000100fe80000000000000",
+            "00000000000000000800060000010000080004000200000024000c000000000000000000000000000000000000000000",
+            "00000000000000000000000005001400000000007400000018000200010000000b990a000a400000fe02000100000000",
+            "08000f00fe00000014000100fe8000000000000000000000000000000800060000010000080004000300000024000c00",
+            "000000000000000000000000000000000000000000000000000000000000000005001400000000007400000018000200",
+            "010000000b990a000a400000fe0200010000000008000f00fe00000014000100fe800000000000000000000000000000",
+            "0800060000010000080004000400000024000c0000000000000000000000000000000000000000000000000000000000",
+            "0000000005001400000000007400000018000200010000000b990a000a800000ff0200020000000008000f00ff000000",
+            "14000100000000000000000000000000000000010800060000000000080004000100000024000c000000000000000000",
+            "00000000000000000000000000000000000000000000000005001400000000007400000018000200010000000b990a00",
+            "0a800000ff0200020000000008000f00ff00000014000100fe80000000000000506284fffec65a670800060000000000",
+            "080004000400000024000c00000000000000000000000000000000000000000000000000000000000000000005001400",
+            "000000007400000018000200010000000b990a000a800000ff0200020000000008000f00ff00000014000100fe800000",
+            "00000000a04930fffec534710800060000000000080004000200000024000c0000000000000000000000000000000000",
+            "0000000000000000000000000000000005001400000000007400000018000200010000000b990a000a800000ff020002",
+            "0000000008000f00ff00000014000100fe80000000000000c07632fffe61909008000600000000000800040003000000",
+            "24000c000000000000000000000000000000000000000000000000000000000000000000050014000000000074000000",
+            "18000200010000000b990a000a080000ff0200050000000008000f00ff00000014000100ff0000000000000000000000",
+            "000000000800060000010000080004000200000024000c00000000000000000000000000000000000000000000000000",
+            "000000000000000005001400000000007400000018000200010000000b990a000a080000ff0200050000000008000f00",
+            "ff00000014000100ff0000000000000000000000000000000800060000010000080004000300000024000c0000000000",
+            "000000000000000000000000000000000000000000000000000000000500140000000000740000001800020001000000",
+            "0b990a000a080000ff0200050000000008000f00ff00000014000100ff00000000000000000000000000000008000600",
+            "00010000080004000400000024000c000000000000000000000000000000000000000000000000000000000000000000",
+            "05001400000000001400000003000200010000000b990a0000000000",
+        );
+
+        #[test]
+        fn a_real_wg_quick_layout_is_parsed_and_proves_the_tunnel_path() {
+            let (routes, rules) = dumps();
+            let unsuppressed = rules
+                .iter()
+                .filter(|rule| rule.suppress_prefix_len.is_none());
+            assert_eq!(
+                unsuppressed.count(),
+                rules.len() - 1,
+                "only one rule suppresses"
+            );
+            assert!(default_route_via(&routes, AF_INET, 2));
+            assert!(
+                default_route_via(&routes, AF_INET, 4),
+                "the host keeps a direct default"
+            );
+            let report = path_report(&routes, &rules, 4002, 2, &["9.9.9.9".parse().unwrap()]);
+            assert!(report.all(), "{report:?}");
+            // The same real dump with the tunnel rule removed exposes the direct default.
+            let without_tunnel_rule: Vec<Rule> = rules
+                .iter()
+                .filter(|rule| !(rule.family == AF_INET && rule.priority == 32765))
+                .cloned()
+                .collect();
+            let leak = path_report(&routes, &without_tunnel_rule, 4002, 2, &[]);
+            assert!(!leak.ipv4_tunnel, "{leak:?}");
+        }
     }
 }
