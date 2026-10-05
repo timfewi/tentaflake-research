@@ -1,12 +1,26 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use secure_research::egress_control::{lock_output, protected_parent, publish};
 use secure_research::error::{ErrorCode, Result};
+use secure_research::vpn_evidence::{
+    self as evidence, AF_INET, AF_INET6, MAX_DUMP_BYTES, RTM_GETROUTE, RTM_GETRULE, Route, Rule,
+};
 use secure_research::vpn_observer::{Observation, Observer};
 use secure_research::{diagnostics, diagnostics::Component, diagnostics::Event};
+use std::net::IpAddr;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// The tunnel implementation whose link kind is checked. Selecting one is an
+/// operator decision; no vendor is required.
+#[derive(Clone, Copy, ValueEnum)]
+enum LinkKind {
+    /// `DEVTYPE=wireguard` in the interface's uevent.
+    Wireguard,
+    /// A layer-3 tun device (for example Tailscale's), identified by `tun_flags`.
+    Tun,
+}
 
 #[derive(Parser)]
 struct Args {
@@ -28,13 +42,33 @@ struct Args {
     /// installer creates. It is a marker, not proof of the firewall rules.
     #[arg(long)]
     firewall_marker: PathBuf,
+    /// Require the interface to be this kind of link. Not selected by default.
+    #[arg(long, value_enum)]
+    link_kind: Option<LinkKind>,
+    /// Observe the paths of this egress UID: unmarked IPv4 traffic must use the
+    /// tunnel and IPv6 must not leave through another interface. Not selected by
+    /// default; the baseline only needs a default route on the interface.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    egress_uid: Option<u32>,
+    /// A resolver the egress identity queries (at most four). Each must be reached
+    /// through the tunnel. Requires --egress-uid.
+    #[arg(long = "dns-resolver", requires = "egress_uid", num_args = 1)]
+    dns_resolvers: Vec<IpAddr>,
+    /// A root-owned marker whose presence requests a planned exit change: the
+    /// observer reports draining, and a fresh generation once it is removed.
+    #[arg(long)]
+    drain_marker: Option<PathBuf>,
     #[arg(long, default_value = "/sys")]
     sysfs: PathBuf,
-    /// Optional pre-recorded NETLINK_ROUTE RTM_GETROUTE dump, used only by the
+    /// Optional pre-recorded NETLINK_ROUTE RTM_GETROUTE dump (IPv4 and, when
+    /// observing an egress UID, IPv6 dumps concatenated), used only by the
     /// synthetic namespace fixture. Omitted in deployment, where the observer
-    /// performs a live netlink dump of every routing table.
+    /// performs live netlink dumps of every routing table.
     #[arg(long)]
     route_dump: Option<PathBuf>,
+    /// Optional pre-recorded RTM_GETRULE dump for the same fixture purpose.
+    #[arg(long, requires = "egress_uid")]
+    rule_dump: Option<PathBuf>,
 }
 
 fn main() {
@@ -46,6 +80,9 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+    if args.dns_resolvers.len() > 4 {
+        return Err(ErrorCode::InvalidRequest);
+    }
     if !rustix::process::geteuid().is_root() {
         return Err(ErrorCode::PermissionDenied);
     }
@@ -53,6 +90,10 @@ fn run() -> Result<()> {
         return Err(ErrorCode::InvalidRequest);
     }
     protected_parent(&args.output)?;
+    if let Some(marker) = &args.drain_marker {
+        // A drain marker in a directory other identities can write is refused.
+        protected_parent(marker)?;
+    }
     // The observation directory is deliberately distinct from the controller's
     // control directory; this lock only excludes a second observer of the same
     // lease file. The controller keeps its own lock in its own directory.
@@ -61,7 +102,7 @@ fn run() -> Result<()> {
     // Fail closed before the first proof: never leave a predecessor's Ready lease.
     publish(
         &args.output,
-        &observer.update(&not_ready(), chrono::Utc::now().timestamp()),
+        &observer.update(&Observation::not_ready(), chrono::Utc::now().timestamp()),
     )?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -89,7 +130,7 @@ fn run() -> Result<()> {
             }
             publish(
                 &args.output,
-                &observer.update(&not_ready(), chrono::Utc::now().timestamp()),
+                &observer.update(&Observation::not_ready(), chrono::Utc::now().timestamp()),
             )
         })
 }
@@ -107,25 +148,47 @@ fn valid_interface(interface: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
-fn not_ready() -> Observation {
-    Observation {
-        interface_up: false,
-        default_route: false,
-        firewall_marker: false,
-        region: None,
-    }
-}
-
 fn diagnostic(event: Event) {
     diagnostics::emit(Component::VpnObserver, event);
 }
 
 fn gather(args: &Args) -> Observation {
+    // An untrustworthy drain marker is never ignored: fail closed.
+    let Some(draining) = drain_requested(args.drain_marker.as_deref()) else {
+        return Observation::not_ready();
+    };
+    let index = match nix::net::if_::if_nametoindex(args.interface.as_str()) {
+        Ok(index) => Some(index),
+        Err(_) => {
+            diagnostic(Event::InterfaceIndexUnavailable);
+            None
+        }
+    };
+    let routes = index.and_then(|_| read_routes(args));
+    let default_route = match (&routes, index) {
+        (Some(routes), Some(index)) => {
+            let found = evidence::default_route_via(routes, AF_INET, index);
+            if !found {
+                diagnostic(Event::NoDefaultRoute);
+            }
+            found
+        }
+        _ => false,
+    };
+    let egress_paths = args.egress_uid.map(|uid| match (&routes, index) {
+        (Some(routes), Some(index)) => egress_paths(args, routes, uid, index),
+        _ => false,
+    });
     Observation {
         interface_up: interface_up(&args.sysfs, &args.interface),
-        default_route: default_route(&args.interface, args.route_dump.as_deref()),
+        default_route,
         firewall_marker: firewall_marker(&args.firewall_marker),
         region: args.region.clone(),
+        link_kind: args
+            .link_kind
+            .map(|kind| link_kind(&args.sysfs, &args.interface, kind)),
+        egress_paths,
+        draining,
     }
 }
 
@@ -150,152 +213,134 @@ fn interface_up(sysfs: &Path, interface: &str) -> bool {
     }
 }
 
-/// A default IPv4 route on the named interface, searched across every routing
-/// table. Tailscale's exit-node feature installs the default route in a
-/// policy-routing table rather than the main table, so reading only
-/// `/proc/net/route` would falsely report offline. A live NETLINK_ROUTE dump
-/// covers all tables. IPv6 default-route proof stays delegated to the kernel
-/// firewall invariant.
-fn default_route(interface: &str, route_dump: Option<&Path>) -> bool {
-    let index = match nix::net::if_::if_nametoindex(interface) {
-        Ok(index) => index,
-        Err(_) => {
-            diagnostic(Event::InterfaceIndexUnavailable);
-            return false;
-        }
+/// The interface is the selected kind of link, so a same-named dummy or bridge
+/// device is not accepted as the tunnel.
+fn link_kind(sysfs: &Path, interface: &str, kind: LinkKind) -> bool {
+    let directory = sysfs.join("class/net").join(interface);
+    let matches = match kind {
+        LinkKind::Wireguard => match std::fs::read_to_string(directory.join("uevent")) {
+            Ok(uevent) => uevent.lines().any(|line| line == "DEVTYPE=wireguard"),
+            Err(_) => {
+                diagnostic(Event::LinkKindUnreadable);
+                return false;
+            }
+        },
+        LinkKind::Tun => directory.join("tun_flags").is_file(),
     };
-    let dump = route_dump.map_or_else(read_route_dump, |path| std::fs::read(path).ok());
-    let Some(dump) = dump else {
+    if !matches {
+        diagnostic(Event::LinkKindMismatch);
+    }
+    matches
+}
+
+/// `Some(false)` when no drain is requested, `Some(true)` for a trustworthy
+/// marker and `None` for anything else, which the caller treats as offline.
+fn drain_requested(marker: Option<&Path>) -> Option<bool> {
+    let Some(path) = marker else {
+        return Some(false);
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0 =>
+        {
+            Some(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        _ => {
+            diagnostic(Event::DrainMarkerInsecure);
+            None
+        }
+    }
+}
+
+/// Route evidence for every routing table: a live NETLINK_ROUTE dump, or the
+/// synthetic fixture's recorded one. Tailscale's exit-node feature installs the
+/// default route in a policy-routing table, which `/proc/net/route` would miss.
+fn read_routes(args: &Args) -> Option<Vec<Route>> {
+    let families: &[u8] = if args.egress_uid.is_some() {
+        &[AF_INET, AF_INET6]
+    } else {
+        &[AF_INET]
+    };
+    let Some(dump) = dump(args.route_dump.as_deref(), RTM_GETROUTE, families) else {
         diagnostic(Event::RouteDumpUnavailable);
+        return None;
+    };
+    let routes = evidence::parse_routes(&dump);
+    if routes.is_none() {
+        diagnostic(Event::RouteDumpMalformed);
+    }
+    routes
+}
+
+fn read_rules(args: &Args) -> Option<Vec<Rule>> {
+    let Some(dump) = dump(args.rule_dump.as_deref(), RTM_GETRULE, &[AF_INET, AF_INET6]) else {
+        diagnostic(Event::RuleDumpUnavailable);
+        return None;
+    };
+    let rules = evidence::parse_rules(&dump);
+    if rules.is_none() {
+        diagnostic(Event::RuleDumpMalformed);
+    }
+    rules
+}
+
+/// IPv4 tunnel path, IPv6 containment and resolver paths of the egress UID.
+fn egress_paths(args: &Args, routes: &[Route], uid: u32, tunnel_index: u32) -> bool {
+    let Some(rules) = read_rules(args) else {
         return false;
     };
-    match default_route_index(&dump, index) {
-        Some(true) => true,
-        Some(false) => {
-            diagnostic(Event::NoDefaultRoute);
-            false
-        }
-        None => {
-            diagnostic(Event::RouteDumpMalformed);
-            false
-        }
+    let report = evidence::path_report(routes, &rules, uid, tunnel_index, &args.dns_resolvers);
+    if !report.ipv4_tunnel {
+        diagnostic(Event::Ipv4PathNotTunnel);
     }
+    if !report.ipv6_contained {
+        diagnostic(Event::Ipv6PathNotContained);
+    }
+    if !report.dns_tunnel {
+        diagnostic(Event::DnsPathNotTunnel);
+    }
+    report.all()
 }
 
-const NLMSG_ERROR: u16 = 2;
-const NLMSG_DONE: u16 = 3;
-const RTM_NEWROUTE: u16 = 24;
-const RTM_GETROUTE: u16 = 26;
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_DUMP: u16 = 0x300; // NLM_F_ROOT | NLM_F_MATCH
-const AF_INET: u8 = 2;
-const RTA_OIF: u16 = 4;
-const MAX_ROUTE_DUMP_BYTES: usize = 4 * 1024 * 1024;
 
-fn align4(length: usize) -> usize {
-    (length + 3) & !3
-}
-
-fn u16_at(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_ne_bytes([bytes[offset], bytes[offset + 1]])
-}
-
-fn u32_at(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_ne_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ])
-}
-
-/// True once the dump has reached its terminating NLMSG_DONE. A not-yet-complete
-/// prefix, or a truncated header, reads false so the caller keeps reading up to
-/// the size bound and then fails closed.
-fn dump_complete(dump: &[u8]) -> bool {
-    let mut offset = 0;
-    while offset + 16 <= dump.len() {
-        let length = u32_at(dump, offset) as usize;
-        if length < 16 || offset + length > dump.len() {
-            return false;
+/// A recorded dump from the synthetic fixture, or live dumps of each family.
+fn dump(recorded: Option<&Path>, kind: u16, families: &[u8]) -> Option<Vec<u8>> {
+    match recorded {
+        Some(path) => {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)
+                .ok()?
+                .take(MAX_DUMP_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            (bytes.len() <= MAX_DUMP_BYTES).then_some(bytes)
         }
-        if u16_at(dump, offset + 4) == NLMSG_DONE {
-            return true;
-        }
-        offset += align4(length);
+        None => families
+            .iter()
+            .map(|family| read_dump(kind, *family))
+            .collect::<Option<Vec<_>>>()
+            .map(|dumps| dumps.concat()),
     }
-    false
 }
 
-/// The route's output interface index from its RTA_OIF attribute, if present.
-fn route_output_index(payload: &[u8]) -> Option<u32> {
-    // payload begins with a 12-byte rtmsg; attributes follow.
-    if payload.len() < 12 {
-        return None;
-    }
-    let mut offset = 12;
-    while offset + 4 <= payload.len() {
-        let length = u16_at(payload, offset) as usize;
-        let attribute = u16_at(payload, offset + 2);
-        if length < 4 || offset + length > payload.len() {
-            return None;
-        }
-        if attribute == RTA_OIF && length >= 8 {
-            return Some(u32_at(payload, offset + 4));
-        }
-        offset += align4(length);
-    }
-    None
-}
-
-/// Parse a NETLINK_ROUTE RTM_GETROUTE dump and report whether any IPv4 default
-/// route leaves through `target_index`. `None` means the dump is truncated or
-/// malformed and must be treated as not-ready.
-fn default_route_index(dump: &[u8], target_index: u32) -> Option<bool> {
-    let mut offset = 0;
-    let mut found = false;
-    while offset < dump.len() {
-        if dump.len() - offset < 16 {
-            return None;
-        }
-        let length = u32_at(dump, offset) as usize;
-        if length < 16 || offset + length > dump.len() {
-            return None;
-        }
-        let message_type = u16_at(dump, offset + 4);
-        let payload = &dump[offset + 16..offset + length];
-        match message_type {
-            NLMSG_DONE => return Some(found),
-            NLMSG_ERROR if payload.len() >= 4 && u32_at(payload, 0) != 0 => return None,
-            RTM_NEWROUTE if payload.len() >= 12 => {
-                let family = payload[0];
-                let destination_length = payload[1];
-                if family == AF_INET
-                    && destination_length == 0
-                    && route_output_index(payload) == Some(target_index)
-                {
-                    found = true;
-                }
-            }
-            _ => {}
-        }
-        offset += align4(length);
-    }
-    None
-}
-
-fn route_dump_request() -> Vec<u8> {
+fn dump_request(kind: u16, family: u8) -> Vec<u8> {
     let mut request = vec![0u8; 28];
     request[0..4].copy_from_slice(&28u32.to_ne_bytes()); // nlmsg_len
-    request[4..6].copy_from_slice(&RTM_GETROUTE.to_ne_bytes());
+    request[4..6].copy_from_slice(&kind.to_ne_bytes());
     request[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
     request[8..12].copy_from_slice(&1u32.to_ne_bytes()); // seq
-    // rtmsg: family AF_INET, table RT_TABLE_UNSPEC (0) -> dump every table.
-    request[16] = AF_INET;
+    // rtmsg / fib_rule_hdr: the family selects the dump; table 0 is every table.
+    request[16] = family;
     request
 }
 
-fn read_route_dump() -> Option<Vec<u8>> {
+/// One live NETLINK_ROUTE dump (routes or rules) of a family, read to its
+/// terminator within the size bound.
+fn read_dump(kind: u16, family: u8) -> Option<Vec<u8>> {
     use nix::sys::socket::{
         AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, recv, sendto,
         socket,
@@ -309,7 +354,7 @@ fn read_route_dump() -> Option<Vec<u8>> {
     .ok()?;
     sendto(
         socket.as_raw_fd(),
-        &route_dump_request(),
+        &dump_request(kind, family),
         &NetlinkAddr::new(0, 0),
         MsgFlags::empty(),
     )
@@ -322,10 +367,10 @@ fn read_route_dump() -> Option<Vec<u8>> {
             return None;
         }
         dump.extend_from_slice(&buffer[..received]);
-        if dump_complete(&dump) {
+        if evidence::dump_complete(&dump) {
             return Some(dump);
         }
-        if dump.len() > MAX_ROUTE_DUMP_BYTES {
+        if dump.len() > MAX_DUMP_BYTES {
             return None;
         }
     }
@@ -341,93 +386,4 @@ fn firewall_marker(path: &Path) -> bool {
         diagnostic(Event::FirewallMarkerInsecure);
     }
     secure
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn done_message() -> Vec<u8> {
-        let mut bytes = vec![0u8; 16];
-        bytes[0..4].copy_from_slice(&16u32.to_ne_bytes());
-        bytes[4..6].copy_from_slice(&NLMSG_DONE.to_ne_bytes());
-        bytes
-    }
-
-    fn route_message(
-        family: u8,
-        destination_length: u8,
-        table: u8,
-        output_index: Option<u32>,
-    ) -> Vec<u8> {
-        let mut payload = vec![0u8; 12];
-        payload[0] = family;
-        payload[1] = destination_length;
-        payload[4] = table;
-        if let Some(index) = output_index {
-            let mut attribute = vec![0u8; 8];
-            attribute[0..2].copy_from_slice(&8u16.to_ne_bytes());
-            attribute[2..4].copy_from_slice(&RTA_OIF.to_ne_bytes());
-            attribute[4..8].copy_from_slice(&index.to_ne_bytes());
-            payload.extend_from_slice(&attribute);
-        }
-        let length = 16 + payload.len();
-        let mut bytes = vec![0u8; align4(length)];
-        bytes[0..4].copy_from_slice(&(length as u32).to_ne_bytes());
-        bytes[4..6].copy_from_slice(&RTM_NEWROUTE.to_ne_bytes());
-        bytes[16..16 + payload.len()].copy_from_slice(&payload);
-        bytes
-    }
-
-    #[test]
-    fn default_route_in_a_policy_routing_table_is_detected() {
-        let mut dump = route_message(AF_INET, 0, 52, Some(7));
-        dump.extend_from_slice(&done_message());
-        assert_eq!(default_route_index(&dump, 7), Some(true));
-    }
-
-    #[test]
-    fn default_route_in_the_main_table_still_matches() {
-        let mut dump = route_message(AF_INET, 0, 254, Some(7));
-        dump.extend_from_slice(&done_message());
-        assert_eq!(default_route_index(&dump, 7), Some(true));
-    }
-
-    #[test]
-    fn default_route_on_another_interface_is_ignored() {
-        let mut dump = route_message(AF_INET, 0, 52, Some(3));
-        dump.extend_from_slice(&done_message());
-        assert_eq!(default_route_index(&dump, 7), Some(false));
-    }
-
-    #[test]
-    fn a_non_default_route_does_not_satisfy_readiness() {
-        let mut dump = route_message(AF_INET, 24, 52, Some(7));
-        dump.extend_from_slice(&done_message());
-        assert_eq!(default_route_index(&dump, 7), Some(false));
-    }
-
-    #[test]
-    fn ipv6_default_route_is_not_counted() {
-        let mut dump = route_message(10, 0, 52, Some(7));
-        dump.extend_from_slice(&done_message());
-        assert_eq!(default_route_index(&dump, 7), Some(false));
-    }
-
-    #[test]
-    fn truncated_or_incomplete_dump_fails_closed() {
-        let dump = route_message(AF_INET, 0, 52, Some(7));
-        assert_eq!(default_route_index(&dump, 7), None);
-        assert_eq!(default_route_index(&dump[..4], 7), None);
-        assert!(!dump_complete(&dump));
-    }
-
-    #[test]
-    fn netlink_error_fails_closed() {
-        let mut bytes = vec![0u8; 20];
-        bytes[0..4].copy_from_slice(&20u32.to_ne_bytes());
-        bytes[4..6].copy_from_slice(&NLMSG_ERROR.to_ne_bytes());
-        bytes[16..20].copy_from_slice(&1i32.to_ne_bytes()); // non-zero errno
-        assert_eq!(default_route_index(&bytes, 7), None);
-    }
 }
