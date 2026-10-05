@@ -329,6 +329,22 @@ in
         default = 5;
         description = "Observation renewal interval; the independent lease lifetime is ten seconds, leaving at least five seconds of renewal headroom.";
       };
+      linkKind = mkOption {
+        type = types.nullOr (
+          types.enum [
+            "wireguard"
+            "tun"
+          ]
+        );
+        default = null;
+        description = "Require the VPN interface to be this kind of link (a WireGuard device or a layer-3 tun device such as Tailscale's). Not selected by default; no VPN vendor is required.";
+      };
+      egressPathEvidence = mkEnableOption "observation of the egress identity's paths: unmarked IPv4 traffic must use the tunnel, IPv6 must not leave through another interface and every configured resolver must be reached through the tunnel. Not selected by default; the baseline only needs a default route on the interface";
+      drainMarker = mkOption {
+        type = types.nullOr runtimePath;
+        default = null;
+        description = "A root-owned, non-group/world-writable marker whose presence requests a planned exit change: the observer reports draining for the current generation and a new generation once the marker is removed. Its parent directories must be root-owned and not writable by other identities; an untrustworthy marker makes the exit offline.";
+      };
     };
     privacy = mkOption {
       type = types.enum [
@@ -503,6 +519,22 @@ in
           {
             assertion = !cfg.vpnObserver.enable || cfg.vpnObserver.firewallMarker != null;
             message = "The reference VPN observer requires vpnObserver.firewallMarker.";
+          }
+          {
+            assertion =
+              cfg.vpnObserver.enable
+              || (
+                cfg.vpnObserver.linkKind == null
+                && !cfg.vpnObserver.egressPathEvidence
+                && cfg.vpnObserver.drainMarker == null
+              );
+            message = "vpnObserver.linkKind, egressPathEvidence and drainMarker apply only with vpnObserver.enable.";
+          }
+          {
+            assertion =
+              cfg.vpnObserver.drainMarker == null
+              || cfg.vpnObserver.drainMarker != cfg.vpnObserver.firewallMarker;
+            message = "vpnObserver.drainMarker must differ from vpnObserver.firewallMarker.";
           }
           {
             assertion =
@@ -762,7 +794,15 @@ in
             Group = "root";
             ExecStart =
               "${cfg.egressPackage}/bin/research-vpn-observer --interface ${interface} --output ${cfg.observationFile} --refresh-seconds ${toString cfg.vpnObserver.refreshSeconds} --firewall-marker ${cfg.vpnObserver.firewallMarker}"
-              + lib.optionalString (cfg.vpnObserver.region != null) " --region ${cfg.vpnObserver.region}";
+              + lib.optionalString (cfg.vpnObserver.region != null) " --region ${cfg.vpnObserver.region}"
+              + lib.optionalString (cfg.vpnObserver.linkKind != null) " --link-kind ${cfg.vpnObserver.linkKind}"
+              + lib.optionalString cfg.vpnObserver.egressPathEvidence (
+                " --egress-uid ${toString egressUid}"
+                + lib.concatMapStrings (resolver: " --dns-resolver ${resolver}") cfg.resolvers
+              )
+              + lib.optionalString (
+                cfg.vpnObserver.drainMarker != null
+              ) " --drain-marker ${cfg.vpnObserver.drainMarker}";
             # No RootDirectory: the observer must read the host's /sys/class/net
             # and query its routing tables over NETLINK_ROUTE, which a private
             # network namespace would hide.

@@ -52,6 +52,21 @@ let
     vpnOuterMark = 21063;
     vpnOuterEndpoints = [ outerEndpoint ];
   };
+  observerService =
+    overrides:
+    (evaluate {
+      vpnObserver = {
+        enable = true;
+        firewallMarker = "/run/research-firewall/ready";
+      }
+      // overrides;
+    }).systemd.services.agent-research-vpn-observer.serviceConfig.ExecStart;
+  defaultObserver = observerService { };
+  selectedObserver = observerService {
+    linkKind = "wireguard";
+    egressPathEvidence = true;
+    drainMarker = "/run/research-drain/marker";
+  };
   logged = evaluate {
     logging.maxBytes = 8388608;
     logging.retentionDays = 3;
@@ -170,6 +185,42 @@ let
           vpnObserver.firewallMarker = "/run/research-firewall/ready";
         }).systemd.services.agent-research-vpn-observer.serviceConfig.LogNamespace;
       expected = "secure-research";
+    };
+    testReferenceObserverSelectsNoExtraEvidenceByDefault = {
+      expr = builtins.any (flag: lib.hasInfix flag defaultObserver) [
+        "--link-kind"
+        "--egress-uid"
+        "--dns-resolver"
+        "--drain-marker"
+      ];
+      expected = false;
+    };
+    testReferenceObserverPassesTheSelectedEvidence = {
+      expr = builtins.all (flag: lib.hasInfix flag selectedObserver) [
+        "--link-kind wireguard"
+        "--egress-uid 4202"
+        "--dns-resolver 9.9.9.9"
+        "--drain-marker /run/research-drain/marker"
+      ];
+      expected = true;
+    };
+    testObserverSelectionsRequireTheObserver = {
+      expr = builtins.all rejected [
+        { vpnObserver.linkKind = "wireguard"; }
+        { vpnObserver.egressPathEvidence = true; }
+        { vpnObserver.drainMarker = "/run/research-drain/marker"; }
+      ];
+      expected = true;
+    };
+    testDrainMarkerMustDifferFromTheFirewallMarker = {
+      expr = rejected {
+        vpnObserver = {
+          enable = true;
+          firewallMarker = "/run/research-firewall/ready";
+          drainMarker = "/run/research-firewall/ready";
+        };
+      };
+      expected = true;
     };
     testLocalSearchJournalNamespace = {
       expr = localSearch.systemd.services.agent-research-searxng.serviceConfig.LogNamespace;
