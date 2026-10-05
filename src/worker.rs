@@ -240,6 +240,9 @@ fn decode(bytes: &[u8], content_type: &str, html: bool) -> Result<(String, &'sta
     Ok((text.into_owned(), encoding.name(), replaced))
 }
 
+/// Version label of the optional Readability representation in `parse_html`.
+pub const READABLE_EXTRACTION_VERSION: &str = "dom_smoothie/0.18.0;formatted-text";
+
 /// This function is called in the isolated worker, never on the service reactor.
 pub fn parse_html(bytes: &[u8], base: &PublicUrl, content_type: &str) -> Result<ParsedDocument> {
     let (html, encoding, replaced) = decode(bytes, content_type, true)?;
@@ -289,9 +292,10 @@ pub fn parse_html(bytes: &[u8], base: &PublicUrl, content_type: &str) -> Result<
             url: url.as_str().into(),
         });
     }
-    // Text-node content preserves Unicode and whitespace. Layout whitespace is
-    // not invented here; the raw HTML remains a separate archived representation.
-    let text = document.select("body").text().to_string();
+    // Derived text keeps every Unicode scalar but drops template indentation and
+    // separates blocks, so adjacent elements do not fuse into one word. `<pre>`
+    // stays verbatim; the exact source whitespace remains in the raw HTML entity.
+    let text = document.select("body").formatted_text().trim().to_owned();
     let content = document.clone();
     content
         .select("nav,header,footer,aside,[role=navigation]")
@@ -314,7 +318,7 @@ pub fn parse_html(bytes: &[u8], base: &PublicUrl, content_type: &str) -> Result<
         max_elements_to_parse: 100_000,
         disable_json_ld: true,
         char_threshold: 0,
-        text_mode: dom_smoothie::TextMode::Raw,
+        text_mode: dom_smoothie::TextMode::Formatted,
         ..Default::default()
     };
     let readable_text = dom_smoothie::Readability::new(html, Some(base.as_str()), Some(config))
@@ -330,7 +334,7 @@ pub fn parse_html(bytes: &[u8], base: &PublicUrl, content_type: &str) -> Result<
         title,
         pages: vec![text],
         readable_text,
-        extraction_version: format!("research-html/v2;dom_query/0.28.0;text-nodes;{encoding}"),
+        extraction_version: format!("research-html/v3;dom_query/0.28.0;formatted-text;{encoding}"),
         links,
         warnings,
     })
@@ -1142,7 +1146,7 @@ mod tests {
             parse_html(html.as_bytes(), &base, "text/html")
                 .unwrap()
                 .pages[0]
-                .contains(&quote)
+                .contains(quote.trim_end())
         );
     }
 
@@ -1221,6 +1225,44 @@ mod tests {
         let parsed = parse_html("<table><tr><th>Name</th><th>Cost</th></tr><tr><td>Model é 👩‍🔬</td><td>$0.10</td></tr></table>".as_bytes(), &PublicUrl::parse("https://example.com/").unwrap(), "text/html").unwrap();
         for text in ["Name", "Cost", "Model é 👩‍🔬", "$0.10"] {
             assert!(parsed.pages[0].contains(text));
+        }
+        assert_eq!(parsed.pages[0], "Name Cost\nModel é 👩‍🔬 $0.10");
+    }
+
+    #[test]
+    fn indented_templates_yield_separated_blocks_without_layout_whitespace() {
+        let paragraph = "Reinstalling the server permanently deletes all existing data é 👩‍🔬.";
+        let html = format!(
+            "<html><head><title>Guide</title></head>\n<body>\n  <nav>\n    <a href='/'>Home</a>\n  </nav>\n  <article>\n    <h1>Reinstall</h1>\n    <ul>\n      <li>Install a different operating system</li>\n      <li>Start with a clean system</li>\n    </ul>\n    <p>{paragraph}</p>\n    <p>{paragraph}</p>\n    <ol><li>Open the menu</li><li>Select Install</li></ol>\n    <pre>keep  this\n  layout</pre>\n  </article>\n</body></html>"
+        );
+        let parsed = parse_html(
+            html.as_bytes(),
+            &PublicUrl::parse("https://example.com/").unwrap(),
+            "text/html",
+        )
+        .unwrap();
+        let mut texts = vec![parsed.pages[0].as_str()];
+        texts.extend(parsed.readable_text.as_deref());
+        assert_eq!(texts.len(), 2, "readable text is expected for this article");
+        for text in texts {
+            assert!(
+                !text.contains("menuSelect"),
+                "blocks glued together: {text:?}"
+            );
+            assert!(text.contains("Install a different operating system\n"));
+            assert!(text.contains("Open the menu\n"));
+            assert!(text.contains("Select Install"));
+            assert!(text.contains(paragraph));
+            assert!(
+                text.contains("keep  this\n  layout"),
+                "<pre> is verbatim: {text:?}"
+            );
+            let outside_pre = text.replace("keep  this\n  layout", "");
+            assert!(
+                !outside_pre.contains("  ") && !outside_pre.contains("\n\n\n\n"),
+                "{text:?}"
+            );
+            assert_eq!(text.trim(), text);
         }
     }
 

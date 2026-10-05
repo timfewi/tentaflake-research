@@ -491,7 +491,7 @@ impl Fetcher {
                     evidence.push(Evidence {
                         kind: RepresentationKind::Text,
                         bytes: readable.into_bytes(),
-                        extraction_version: "dom_smoothie/0.18.0;raw-text".into(),
+                        extraction_version: worker::READABLE_EXTRACTION_VERSION.into(),
                         derived_from: Some(0),
                         pdf_page: None,
                         text: true,
@@ -661,7 +661,7 @@ impl Fetcher {
                     evidence.push(Evidence {
                         kind: RepresentationKind::Text,
                         bytes: readable.into_bytes(),
-                        extraction_version: "dom_smoothie/0.18.0;raw-text".into(),
+                        extraction_version: worker::READABLE_EXTRACTION_VERSION.into(),
                         derived_from: Some(0),
                         pdf_page: None,
                         text: true,
