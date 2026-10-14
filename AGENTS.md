@@ -27,4 +27,8 @@
 - Missing tools or offline dependencies are environment blockers, not failures.
   Enter the pinned toolchain with `nix develop path:.` (or reload direnv).
   `just lint --json` and `just verify --json` forward options to project-check.
-- Do not stage, commit, push, publish or deploy without explicit authorization.
+- Task-scoped staging is authorized. After review and required checks, commit
+  the task changes and push to the current branch's existing upstream. Preserve
+  unrelated work.
+- Deployment, activation, installation, releases, visibility changes and history
+  rewrites require separate authorization.
