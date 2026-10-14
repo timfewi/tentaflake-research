@@ -9,6 +9,8 @@
 - Preserve existing user changes. Write documentation and CLI text in English.
 - Read README.md, SECURITY.md and docs/development.md before changing boundaries.
 - Keep Cargo artifacts outside `/tmp`, which can be small. Use the pinned shell.
+  `project-check` overrides `CARGO_TARGET_DIR`; set its `TMPDIR` inside that shell
+  as documented in docs/development.md.
 - Run `project-check fast` after meaningful changes. Run affected isolated OS or
   VM fixtures when changing networking, credentials, workers or container clients.
 - Keep Chromium's sandbox enabled. Clients and workers must have no direct IP

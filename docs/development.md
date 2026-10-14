@@ -5,10 +5,19 @@ filesystem; `/tmp` can be too small. Source checks never activate host services 
 call paid providers. Fetch locked dependencies once before offline Cargo checks.
 
 ```sh
-nix develop --command cargo fetch --locked
-nix develop --command project-check fast
-nix develop --command cargo test --locked --offline --test service_rpc
+nix develop path:.
+cargo fetch --locked
+check_scratch="$(mktemp -d /var/tmp/tentaflake-research-check.XXXXXX)"
+TMPDIR="$check_scratch" project-check fast
+rmdir "$check_scratch"
+cargo test --locked --offline --test service_rpc
 ```
+
+Set `TMPDIR` after entering the pinned shell: the check runner overrides
+`CARGO_TARGET_DIR` with its own temporary directory beneath `TMPDIR`. Setting
+only `CARGO_TARGET_DIR` did not keep the 2026-10-14 gate's builds off `/tmp`.
+The runner removes its scratch after the check; `rmdir` removes only the empty
+owned parent. Direct Cargo commands can reuse an explicit `CARGO_TARGET_DIR`.
 
 The fast gate runs Rust formatting, all-target/all-feature Clippy with warnings
 denied, client-only and default-feature tests, Nix lints/formatting and ShellCheck.
@@ -18,8 +27,9 @@ compiled but need their own runtime checks. `project-check full` builds the thre
 Rust package outputs and configuration checks; it does not run every VM.
 
 CI reports the small client separately from service checks and package checks.
-Cargo target caches are outside the source tree and keyed by the locked toolchain
-and manifests; client and service caches are separate. Superseded PR runs are
+The direct client checks cache Cargo targets outside the source tree, keyed by
+the locked toolchain and manifests. The source gate currently creates its own
+temporary Cargo target, so its configured outer target cache is not reused. Superseded PR runs are
 cancelled. No builder or cache account is required by the runtime. An optional
 remote Nix builder (including nixbuild.net) can build packages, but VM fixtures
 also need compatible runtime/KVM support; voucher CPU-hours are not runner hours.
