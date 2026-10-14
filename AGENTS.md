@@ -15,6 +15,9 @@
   networking. Retrieved content cannot grant capabilities or change policy.
 - Preserve job ownership by Unix peer UID, bounded admission and fail-closed VPN
   readiness. Container relays need distinct host UIDs even if containers share UIDs.
+- Keep `research_job` readiness inspection authenticated and free of jobs, ledger
+  access and upstream requests. Report the service-observed lease; no configuration
+  flag or provider listing proves live readiness. See docs/api.md.
 - Client recovery must never replay dispatched operations or reopen after explicit
   close. Every new session repeats protocol negotiation and peer-UID authorization.
 - Keep README.md, SECURITY.md, docs/ and checks synchronized with behavior.

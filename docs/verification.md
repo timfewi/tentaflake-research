@@ -200,3 +200,29 @@ uses the handshake time instead.
 
 Not run: a Tailscale or other exit node, detection of an aged-out handshake in the
 VM (190 s window; the namespace fixture covers it), and production-host acceptance.
+
+## Authenticated admission snapshot (2026-10-14)
+
+`research_job` operation `readiness` reports the authorized relay/client UID,
+effective configuration fingerprint and the service-observed lease under one
+state lock. This supplies an observation for Tentaflake's planned Research
+collector; it grants no capacity and makes no provider-health claim. The five
+tools, v1 transport and job dispatch gates remain unchanged.
+
+Changed source: `src/api.rs`, `src/mcp.rs`, `src/service.rs` and the existing
+service RPC/client transport fixtures. New checks cover strict arguments, real
+Unix peer authorization, full/offline capacity, unchanged SQLite data version and
+job state, no upstream requests, secret-free output, expired/replaced/offline
+generations, shutdown, cancellation and the actual client binary's schema and
+forwarding. Independent source review found no blocker. `project-check fast`
+passed in the pinned shell offline: standalone client checks, 250 default-feature
+library tests, 65 service RPC tests, client process tests, Clippy, formatting,
+source filtering, client-package evaluation, Nix lints and ShellCheck. The redacted
+Gitleaks directory scan found no leaks. Its generic Semgrep baseline scanned no
+Rust files and provides no Rust security evidence.
+
+Next: run the upstream package gate in sequence after Tentaflake's queued OCI/model
+CI. No new package, VM, paid-provider or deployed-host evidence is claimed. The
+downstream collector and its real relay/VPN acceptance remain separate; the
+snapshot alone does not establish that the socket-activated egress process is
+running or has observed the same controller lease.

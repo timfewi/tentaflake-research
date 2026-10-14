@@ -289,6 +289,28 @@ impl Service {
         &self.config.limits
     }
 
+    /// Read-only local state, not provider health, job capacity or a reservation.
+    /// The effective-config hash is distinct from the raw configuration file hash.
+    fn readiness(&self, owner: u32) -> Result<Value> {
+        let state = self.state.lock().map_err(|_| ErrorCode::Storage)?;
+        let observed_at = chrono::Utc::now().timestamp();
+        let egress = &state.egress;
+        Ok(json!({
+            "schema_version": 1,
+            "caller_uid": owner,
+            "policy_sha256": self.policy,
+            "accepting": state.accepting,
+            "observed_at": observed_at,
+            "egress": {
+                "mode": egress.mode,
+                "generation": (!egress.generation.is_nil()).then_some(egress.generation),
+                "valid_until": egress.valid_until,
+                "lease_valid": egress.valid_at(observed_at),
+            },
+            "untrusted": true,
+        }))
+    }
+
     /// Report only installed, operator-granted capabilities after privacy
     /// filtering. Never expose credential names, paths or endpoint overrides.
     fn capabilities(&self) -> Value {
@@ -592,6 +614,7 @@ impl Service {
                     JobArgs::Providers {} => {
                         return Ok(json!({"capabilities": self.capabilities(), "untrusted": true}));
                     }
+                    JobArgs::Readiness {} => return self.readiness(owner),
                     JobArgs::Start { limits } => (self.start(owner, connection, limits)?, false),
                     JobArgs::Status { job_id } => (self.ledger.get(owner, job_id)?, true),
                     JobArgs::Finish { job_id } => (
