@@ -93,6 +93,11 @@ LLM. No commercial provider is selected by default; inspect configured optional
 adapters with `research_job` operation `providers`. [Providers](docs/providers.md) documents data grants and costs. The default
 Tentaflake integration leaves research summarization disabled.
 
+`research_job` operation `readiness` reports the authorized caller UID, effective
+policy fingerprint and the service-observed admission/egress lease without a job
+or upstream request. This snapshot does not test provider authentication or
+reserve capacity; [the API](docs/api.md) defines its freshness and identity limits.
+
 ## Develop
 
 ```sh

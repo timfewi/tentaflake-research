@@ -28,6 +28,9 @@ provider or execution authority. The research client is not a general proxy.
 - Jobs, IPC frames, concurrency, response sizes, deadlines, spending and archives
   are bounded. Parser/browser descendants are supervised. The NixOS slice bounds
   aggregate memory/tasks and worker scratch space.
+- Authenticated readiness inspection reports the service-observed admission and
+  lease state. It grants no capacity, tests no provider and does not replace
+  process/socket identity checks, controller freshness or operation-time gates.
 - Provider keys are runtime systemd credentials. Logs contain bounded categorical
   metadata; source bodies, queries and keys must not enter diagnostics.
 

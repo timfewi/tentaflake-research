@@ -78,6 +78,9 @@ impl SearchQuery {
 pub enum JobArgs {
     /// Inspect effective optional adapters without creating a job or using egress.
     Providers {},
+    /// Snapshot authenticated service admission and its observed egress lease.
+    /// This neither creates a job nor checks live provider availability.
+    Readiness {},
     Start {
         #[serde(default)]
         limits: RequestedLimits,
@@ -363,6 +366,35 @@ impl From<&Source> for SourceBrief {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn readiness_accepts_no_caller_supplied_state_or_authority() {
+        assert!(matches!(
+            serde_json::from_value::<JobArgs>(serde_json::json!({"operation":"readiness"}))
+                .unwrap(),
+            JobArgs::Readiness {}
+        ));
+        for field in [
+            "caller_uid",
+            "policy_sha256",
+            "accepting",
+            "observed_at",
+            "egress",
+            "generation",
+            "job_id",
+            "limits",
+            "provider",
+            "endpoint",
+        ] {
+            assert!(
+                serde_json::from_value::<JobArgs>(serde_json::json!({
+                    "operation":"readiness", field:null,
+                }))
+                .is_err(),
+                "{field}"
+            );
+        }
+    }
+
     #[test]
     fn empty_and_failed_coverage_cannot_be_reported_as_complete_empty() {
         let items = [

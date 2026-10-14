@@ -55,23 +55,36 @@ async fn hello(listener: UnixListener) -> UnixStream {
 #[tokio::test]
 async fn mcp_binary_exposes_five_tools_and_forwards_typed_arguments() {
     let (_root, socket, listener) = listener();
-    let peer = tokio::spawn(async move {
-        let mut stream = hello(listener).await;
-        let request: Request = protocol::read_frame(&mut stream).await.unwrap().unwrap();
-        let Operation::Call { tool, arguments } = &request.operation else {
-            panic!("expected tool call");
-        };
-        assert_eq!(*tool, Tool::ResearchJob);
-        assert_eq!(arguments["operation"], "start");
-        assert_eq!(arguments["limits"]["queries"], 0);
-        reply(&mut stream, request, json!({"job":{"id":"fixture-job"}})).await;
-        assert!(
-            protocol::read_frame::<_, Request>(&mut stream)
-                .await
-                .unwrap()
-                .is_none()
-        );
-    });
+    let peer =
+        tokio::spawn(async move {
+            let mut stream = hello(listener).await;
+            let request: Request = protocol::read_frame(&mut stream).await.unwrap().unwrap();
+            let Operation::Call { tool, arguments } = &request.operation else {
+                panic!("expected tool call");
+            };
+            assert_eq!(*tool, Tool::ResearchJob);
+            assert_eq!(arguments["operation"], "start");
+            assert_eq!(arguments["limits"]["queries"], 0);
+            reply(&mut stream, request, json!({"job":{"id":"fixture-job"}})).await;
+            let request: Request = protocol::read_frame(&mut stream).await.unwrap().unwrap();
+            let Operation::Call { tool, arguments } = &request.operation else {
+                panic!("expected readiness call");
+            };
+            assert_eq!(*tool, Tool::ResearchJob);
+            assert_eq!(arguments, &json!({"operation":"readiness"}));
+            reply(&mut stream, request, json!({
+            "schema_version":1,"caller_uid":1234,"policy_sha256":"a".repeat(64),
+            "accepting":false,"observed_at":123,
+            "egress":{"mode":"offline","generation":null,"valid_until":0,"lease_valid":false},
+            "untrusted":true,
+        })).await;
+            assert!(
+                protocol::read_frame::<_, Request>(&mut stream)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
     let mut child = Command::new(env!("CARGO_BIN_EXE_research-client"))
         .arg("--socket")
         .arg(socket)
@@ -89,6 +102,7 @@ async fn mcp_binary_exposes_five_tools_and_forwards_typed_arguments() {
         json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
         json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"research_job","arguments":{"operation":"start","limits":{"queries":0}}}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"research_job","arguments":{"operation":"readiness"}}}),
     ];
     for message in messages {
         input
@@ -125,11 +139,32 @@ async fn mcp_binary_exposes_five_tools_and_forwards_typed_arguments() {
                     "research_search"
                 ]
             );
+            let schema = &reply["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == "research_job")
+                .unwrap()["inputSchema"];
+            assert_eq!(schema["type"], "object");
+            let readiness = schema["oneOf"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|variant| variant["properties"]["operation"]["const"] == "readiness")
+                .unwrap();
+            assert_eq!(readiness["additionalProperties"], false);
+            assert_eq!(readiness["required"], json!(["operation"]));
+            assert_eq!(readiness["properties"].as_object().unwrap().len(), 1);
         } else if message["id"] == 3 {
             assert_eq!(
                 reply["result"]["structuredContent"]["job"]["id"],
                 "fixture-job"
             );
+        } else if message["id"] == 4 {
+            let snapshot = &reply["result"]["structuredContent"];
+            assert_eq!(snapshot["caller_uid"], 1234);
+            assert_eq!(snapshot["accepting"], false);
+            assert_eq!(snapshot["egress"]["lease_valid"], false);
         }
     }
     drop(input);

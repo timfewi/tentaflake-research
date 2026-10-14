@@ -29,6 +29,13 @@ their freshness and generations; without them the service fails closed. The
 optional reference observer requires an operator-owned firewall readiness marker.
 See [egress-control.md](egress-control.md) and [network-boundary.md](network-boundary.md).
 
+Use `research_job` operation `readiness` through the intended client socket to
+inspect the authorized caller UID, effective policy fingerprint and the lease
+generation actually observed by the service. Compare it with the trusted
+controller and authenticate the installed process/configuration before using it
+for admission. `providers` reports configuration only. Neither operation probes
+an upstream provider; [the API](api.md) defines the snapshot and expiry semantics.
+
 Provider keys stay in runtime credential files. Enabling a provider additionally
 requires explicit capability/data grants and a cost ceiling; a key grants nothing
 on its own. Research summarization stays off in the standard Tentaflake topology,

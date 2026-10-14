@@ -200,3 +200,45 @@ uses the handshake time instead.
 
 Not run: a Tailscale or other exit node, detection of an aged-out handshake in the
 VM (190 s window; the namespace fixture covers it), and production-host acceptance.
+
+## Authenticated admission snapshot (2026-10-14)
+
+`research_job` operation `readiness` reports the authorized relay/client UID,
+effective configuration fingerprint and the service-observed lease under one
+state lock. This supplies an observation for Tentaflake's planned Research
+collector; it grants no capacity and makes no provider-health claim. The five
+tools, v1 transport and job dispatch gates remain unchanged.
+
+Changed source: `src/api.rs`, `src/mcp.rs`, `src/service.rs` and the existing
+service RPC/client transport fixtures. New checks cover strict arguments, real
+Unix peer authorization, full/offline capacity, unchanged SQLite data version and
+job state, no upstream requests, secret-free output, expired/replaced/offline
+generations, shutdown, cancellation and the actual client binary's schema and
+forwarding. Independent source review found no blocker. `project-check fast`
+passed in the pinned shell offline: standalone client checks, 250 default-feature
+library tests, 65 service RPC tests, client process tests, Clippy, formatting,
+source filtering, client-package evaluation, Nix lints and ShellCheck. The redacted
+Gitleaks directory scan found no leaks. Its generic Semgrep baseline scanned no
+Rust files and provides no Rust security evidence.
+
+The upstream package gate passed for `73eabe4`; its OSV check found
+GHSA-5j98-2g5x-46v6, GHSA-6f2x-v7q7-m7m5 and GHSA-6w6g-hm98-mhgm in
+Hickory Resolver 0.26.1. The dependency fix pins resolver exactly to
+[0.26.3](https://github.com/hickory-dns/hickory-dns/releases/tag/v0.26.3), the
+stable release following the 0.26.2 security fixes, and updates only the three
+Hickory lockfile packages. Locked resolution/fetch passed; manifest and used-API
+source review found no required caller change or new build script. All 19 focused
+egress tests passed, including real UDP DNS mixed-address and partial-family
+failure cases. The pinned `project-check fast` passed again, including client
+dependency isolation, 250 default-feature library tests and 65 RPC tests. OSV
+scanned 330 locked packages with no issues; the redacted Gitleaks directory scan
+found no leaks. A fresh package gate for this pin remains pending.
+
+The pinned check runner overrides `CARGO_TARGET_DIR` with its temporary scratch
+directory. This run completed under `/tmp`; future fast runs must set an external
+`TMPDIR` inside the pinned shell to keep build artifacts off that filesystem.
+
+No new VM, paid-provider or deployed-host evidence is claimed. The downstream
+collector and its real relay/VPN acceptance remain separate; the snapshot alone
+does not establish that the socket-activated egress process is running or has
+observed the same controller lease.
