@@ -74,6 +74,13 @@ the job and awaits those leases before deleting temporary evidence. A waiting
 cache consumer can cancel independently of another job's initializer. Shared-UID
 clients are one trust domain, not separate authenticated principals.
 
+Authenticated `research_job` readiness inspection snapshots the service's
+accepting flag and observed egress lease under the state lock. It bypasses job
+allocation and ledger/network work, not authorization or cancellation. Its policy
+fingerprint binds effective configuration within the deployed service version;
+an admission consumer must independently bind the serving process, configuration
+and controller generation. A snapshot never reserves future execution.
+
 The socket reader retains partial frames across operation completion. A stalled
 frame body has a timeout; IDs increase monotonically and calls have bounded
 queues. MCP cancellation, including a dropped adapter future, sends an explicit

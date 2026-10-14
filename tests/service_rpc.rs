@@ -296,6 +296,7 @@ struct Fixture {
     service: Arc<Service>,
     upstream: Arc<Upstream>,
     ledger: Arc<Ledger>,
+    config: Config,
     owner: u32,
 }
 impl Fixture {
@@ -320,6 +321,15 @@ impl Fixture {
         limits: Limits,
         root: tempfile::TempDir,
     ) -> Self {
+        Self::configured(privacy, rights, limits, root, |_| {}).await
+    }
+    async fn configured(
+        privacy: Privacy,
+        rights: bool,
+        limits: Limits,
+        root: tempfile::TempDir,
+        configure: impl FnOnce(&mut Config),
+    ) -> Self {
         // Socket addresses have a fixed byte limit. Keep only the socket nodes
         // in a short private directory; evidence still follows the caller's TMPDIR.
         let sockets = tempfile::Builder::new()
@@ -337,7 +347,7 @@ impl Fixture {
             model: None,
             request_micro_usd: Some(5000),
         };
-        let config = Config {
+        let mut config = Config {
             state_directory: root.path().join("state"),
             privacy,
             egress_uid: Some(1002),
@@ -347,6 +357,7 @@ impl Fixture {
             limits,
             ..Default::default()
         };
+        configure(&mut config);
         std::fs::create_dir_all(&config.state_directory).unwrap();
         let ledger = Ledger::open(
             &config.state_directory.join("budget.sqlite"),
@@ -363,7 +374,7 @@ impl Fixture {
             cleanup_complete: AtomicBool::new(false),
         });
         let service = Service::new(
-            config,
+            config.clone(),
             Dependencies {
                 ledger: ledger.clone(),
                 store,
@@ -383,6 +394,7 @@ impl Fixture {
             service,
             upstream,
             ledger,
+            config,
             owner,
         }
     }
@@ -3713,6 +3725,234 @@ async fn regression_crawl_redirect_destination_is_not_fetched_twice_with_uncache
             .requests,
         14
     );
+}
+
+#[tokio::test]
+async fn readiness_is_authorized_offline_at_capacity_without_budget_or_outbound_work() {
+    let fixture = Fixture::with_limits(
+        Privacy::Practical,
+        false,
+        Limits {
+            active_jobs: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    fixture
+        .service
+        .update_egress(EgressState::offline())
+        .await
+        .unwrap();
+    let (bridge, serving) = fixture.connect().await;
+    let id = job(&bridge).await;
+    assert_eq!(
+        bridge
+            .call(
+                Tool::ResearchJob,
+                json!({"operation":"start"}),
+                CancellationToken::new()
+            )
+            .await
+            .unwrap_err(),
+        ErrorCode::Capacity
+    );
+    let before = serde_json::to_value(fixture.ledger.get(fixture.owner, id).unwrap()).unwrap();
+    // A separate read-only SQLite connection observes every committed mutation
+    // from the service's connection, including a transient job insert/delete.
+    let database = rusqlite::Connection::open_with_flags(
+        fixture.config.state_directory.join("budget.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let version = || {
+        database
+            .query_row("PRAGMA data_version", [], |row| row.get::<_, u64>(0))
+            .unwrap()
+    };
+    let before_version = version();
+    let policy = secure_research::policy::sha256(&serde_json::to_vec(&fixture.config).unwrap());
+    for _ in 0..2 {
+        let earliest = chrono::Utc::now().timestamp();
+        let result = call(&bridge, Tool::ResearchJob, json!({"operation":"readiness"})).await;
+        let observed = result["observed_at"].as_i64().unwrap();
+        assert!((earliest..=chrono::Utc::now().timestamp()).contains(&observed));
+        assert_eq!(
+            result,
+            json!({
+                "schema_version":1, "caller_uid":fixture.owner, "policy_sha256":policy,
+                "accepting":true, "observed_at":observed,
+                "egress":{"mode":"offline","generation":null,"valid_until":0,"lease_valid":false},
+                "untrusted":true,
+            })
+        );
+        let encoded = result.to_string();
+        for private in [
+            "fixture-key",
+            "credential",
+            "endpoint",
+            "https://",
+            "/run/agent-research",
+            fixture._root.path().to_str().unwrap(),
+        ] {
+            assert!(!encoded.contains(private));
+        }
+    }
+    assert_eq!(version(), before_version);
+    assert_eq!(
+        serde_json::to_value(fixture.ledger.get(fixture.owner, id).unwrap()).unwrap(),
+        before
+    );
+    assert!(fixture.upstream.calls.lock().unwrap().is_empty());
+    bridge.close().await;
+    serving.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn readiness_preserves_observed_generations_modes_and_shutdown_state() {
+    let fixture = Fixture::new(Privacy::Practical, false).await;
+    let (bridge, serving) = fixture.connect().await;
+    let mut state = ready();
+    for mode in [EgressMode::Ready, EgressMode::Draining, EgressMode::Offline] {
+        state.mode = mode;
+        state.valid_until = chrono::Utc::now().timestamp() + 10;
+        fixture.service.update_egress(state.clone()).await.unwrap();
+        let result = call(&bridge, Tool::ResearchJob, json!({"operation":"readiness"})).await;
+        assert_eq!(
+            result["egress"],
+            json!({
+                "mode":mode, "generation":state.generation, "valid_until":state.valid_until, "lease_valid":true,
+            })
+        );
+        assert_eq!(result["accepting"], true);
+    }
+    let previous_generation = state.generation;
+    state = ready();
+    assert_ne!(state.generation, previous_generation);
+    fixture.service.update_egress(state.clone()).await.unwrap();
+    let result = call(&bridge, Tool::ResearchJob, json!({"operation":"readiness"})).await;
+    assert_eq!(result["egress"]["generation"], json!(state.generation));
+    assert_eq!(result["egress"]["mode"], "ready");
+
+    fixture.service.shutdown().await.unwrap();
+    let result = call(&bridge, Tool::ResearchJob, json!({"operation":"readiness"})).await;
+    assert_eq!(result["accepting"], false);
+    assert_eq!(result["egress"]["generation"], json!(state.generation));
+    assert_eq!(result["egress"]["lease_valid"], true);
+    assert!(fixture.upstream.calls.lock().unwrap().is_empty());
+    bridge.close().await;
+    serving.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn readiness_rechecks_expiry_without_a_controller_update() {
+    let fixture = Fixture::new(Privacy::Practical, false).await;
+    let (bridge, serving) = fixture.connect().await;
+    let mut state = ready();
+    state.valid_until = chrono::Utc::now().timestamp() + 1;
+    fixture.service.update_egress(state.clone()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while chrono::Utc::now().timestamp() < state.valid_until {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // No update_egress call occurs between lease installation and this probe.
+    let result = call(&bridge, Tool::ResearchJob, json!({"operation":"readiness"})).await;
+    assert_eq!(
+        result["egress"],
+        json!({
+            "mode":"ready", "generation":state.generation, "valid_until":state.valid_until, "lease_valid":false,
+        })
+    );
+    assert_eq!(result["accepting"], true);
+    state.valid_until = chrono::Utc::now().timestamp() + 600;
+    fixture.service.update_egress(state).await.unwrap();
+    let result = call(&bridge, Tool::ResearchJob, json!({"operation":"readiness"})).await;
+    assert_eq!(result["egress"]["lease_valid"], false);
+    assert!(fixture.upstream.calls.lock().unwrap().is_empty());
+    bridge.close().await;
+    serving.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn readiness_rejects_spoofed_arguments_and_cancelled_calls() {
+    let fixture = Fixture::new(Privacy::Practical, false).await;
+    let (bridge, serving) = fixture.connect().await;
+    for extra in [
+        "caller_uid",
+        "policy_sha256",
+        "accepting",
+        "observed_at",
+        "egress",
+        "generation",
+        "job_id",
+        "limits",
+    ] {
+        assert_eq!(
+            bridge
+                .call(
+                    Tool::ResearchJob,
+                    json!({"operation":"readiness",extra:null}),
+                    CancellationToken::new()
+                )
+                .await
+                .unwrap_err(),
+            ErrorCode::InvalidRequest
+        );
+    }
+    let stop = CancellationToken::new();
+    stop.cancel();
+    assert_eq!(
+        fixture
+            .service
+            .call(
+                fixture.owner,
+                Uuid::new_v4(),
+                Tool::ResearchJob,
+                json!({"operation":"readiness"}),
+                stop,
+            )
+            .await
+            .unwrap_err(),
+        ErrorCode::Cancelled
+    );
+    assert_eq!(
+        fixture
+            .service
+            .call(
+                fixture.owner + 2,
+                Uuid::new_v4(),
+                Tool::ResearchJob,
+                json!({"operation":"readiness"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err(),
+        ErrorCode::PermissionDenied
+    );
+    assert!(fixture.upstream.calls.lock().unwrap().is_empty());
+    bridge.close().await;
+    serving.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn readiness_cannot_bypass_real_unix_peer_authorization() {
+    let fixture = Fixture::configured(
+        Privacy::Practical,
+        false,
+        Limits::default(),
+        tempfile::tempdir().unwrap(),
+        |config| config.allowed_client_uids = vec![rustix::process::getuid().as_raw() + 2],
+    )
+    .await;
+    let (socket, serving) = fixture.curl_listener("unauthorized.sock");
+    assert!(Bridge::connect(&socket).await.is_err());
+    assert_eq!(
+        serving.await.unwrap().unwrap_err(),
+        ErrorCode::PermissionDenied
+    );
+    assert!(fixture.upstream.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

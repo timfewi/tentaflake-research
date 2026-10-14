@@ -20,7 +20,7 @@ service-authored categorical fields and never include tool input or source data.
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
-| `research_job` | `operation`: `providers`, `start`, `status`, `finish`, `cancel`; `job_id` for status/finish/cancel; optional reduced `limits` on start | Job state, limits, usage, remaining budgets, granted capabilities and available source IDs |
+| `research_job` | `operation`: `providers`, `readiness`, `start`, `status`, `finish`, `cancel`; `job_id` for status/finish/cancel; optional reduced `limits` on start | Configuration or admission snapshot; otherwise job state, budgets, granted capabilities and available source IDs |
 | `research_search` | `job_id`, `queries`: objects with `q`, optional `count`, `language`, `country`, `freshness` | Per-query state, snippets, source, provider, cache hit, coverage and usage |
 | `research_fetch` | `job_id`, `urls`, optional `mode`: `auto`, `http`, `browser`, `provider`; optional `crawl` (`pages`, `depth`) with `http`/`auto` | Per-URL state, source, raw-source ID, link preview, complete links representation, extraction error, JavaScript need and an optional bounded-crawl summary |
 | `research_browser` | `action`: `open`, `read`, `follow_link`, `expand`, `scroll`, `close`, with job/session/versioned reference as applicable | Session ID, observed page/references, DOM and text sources, cumulative HTTP receipts, partial/error state |
@@ -65,6 +65,49 @@ job is started. It allocates no job, consumes no job budget and makes no network
 requests, so it remains available when egress is offline or job capacity is full.
 Unix peer authorization still applies. This reports operator configuration, not
 live provider reachability or tariffs.
+
+`{"operation":"readiness"}` returns an authenticated snapshot of the service's
+current admission state. It accepts no additional arguments, creates no job,
+reads or writes no ledger state and makes no network requests. It remains
+available at full job capacity, while offline and during service shutdown while
+the connection is still served. A cancelled request remains cancelled.
+
+```json
+{
+  "schema_version": 1,
+  "caller_uid": 61001,
+  "policy_sha256": "<64 lowercase hexadecimal characters>",
+  "accepting": true,
+  "observed_at": 1791940000,
+  "egress": {
+    "mode": "ready",
+    "generation": "00000000-0000-4000-8000-000000000001",
+    "valid_until": 1791940003,
+    "lease_valid": true
+  },
+  "untrusted": true
+}
+```
+
+`caller_uid` is the authorized Unix peer UID seen by the service; through a
+container relay this is the dedicated host relay UID. `policy_sha256` hashes the
+service's serialized effective configuration, including defaults, using this
+service version. It is **not** the hash of the configuration file's raw bytes.
+`accepting`, `observed_at` and `egress` are sampled under the same state lock.
+Times use UTC Unix seconds. `lease_valid` checks the observed lease's schema,
+generation, region and bounded expiry at `observed_at`; it does not mean that
+`mode` is `ready`. Draining, expired and controller-issued offline leases retain
+their generation. The internal startup/missing-lease state has generation `null`
+and `valid_until: 0`. Region, credentials, paths and endpoints are not returned.
+
+Admission consumers must authenticate the service process and immutable
+configuration separately, require `accepting`, `mode: "ready"` and a still-valid
+lease, and compare the service-observed generation with their trusted controller
+observation. A snapshot reserves no capacity and cannot guarantee later dispatch,
+provider authentication, network reachability or continuing VPN health. Existing
+operation-time gates remain authoritative. The five tools and v1 socket envelope
+are unchanged; older services reject `readiness` as `invalid_request`, which must
+not be replaced with a successful `providers` result.
 
 Top-level `capabilities` lists installed adapters with effective operator grants,
 filtered by privacy, under `search`, `scrape` and `summarize`.
