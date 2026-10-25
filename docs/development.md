@@ -13,9 +13,10 @@ rmdir "$check_scratch"
 cargo test --locked --offline --test service_rpc
 ```
 
-Set `TMPDIR` after entering the pinned shell: the check runner overrides
-`CARGO_TARGET_DIR` with its own temporary directory beneath `TMPDIR`. Setting
-only `CARGO_TARGET_DIR` did not keep the 2026-10-14 gate's builds off `/tmp`.
+Set `TMPDIR` after entering the pinned shell to keep per-run scratch off `/tmp`.
+The pinned check runner overrides `CARGO_TARGET_DIR` with a persistent per-checkout
+cache under `$XDG_CACHE_HOME/project-check/` (default `~/.cache/project-check/`).
+Without a writable user cache, it falls back to the per-run scratch directory.
 The runner removes its scratch after the check; `rmdir` removes only the empty
 owned parent. Direct Cargo commands can reuse an explicit `CARGO_TARGET_DIR`.
 
@@ -28,9 +29,9 @@ Rust package outputs and configuration checks; it does not run every VM.
 
 CI reports the small client separately from service checks and package checks.
 The direct client checks cache Cargo targets outside the source tree, keyed by
-the locked toolchain and manifests. The source gate currently creates its own
-temporary Cargo target, so its configured outer target cache is not reused. Superseded PR runs are
-cancelled. No builder or cache account is required by the runtime. An optional
+the locked toolchain and manifests. The source gate uses the runner's separate
+persistent Cargo cache rather than the configured outer target directory.
+Superseded PR runs are cancelled. No builder or cache account is required by the runtime. An optional
 remote Nix builder (including nixbuild.net) can build packages, but VM fixtures
 also need compatible runtime/KVM support; voucher CPU-hours are not runner hours.
 
