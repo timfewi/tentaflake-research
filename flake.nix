@@ -2,7 +2,7 @@
   description = "Isolated public research for local agent harnesses";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/eaad089433ca2bb662274377d33df3d0e51ef28b";
   inputs.project-check = {
-    url = "github:timfewi/project-check-nix/f70de45d69b9ca9a31f5b9f94e316ac6e43e514e";
+    url = "github:timfewi/project-check-nix/56962fbd92f992938f39b44b2590adf843ebe757";
     inputs.nixpkgs.follows = "nixpkgs";
   };
   outputs =
