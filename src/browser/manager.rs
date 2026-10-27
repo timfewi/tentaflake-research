@@ -180,7 +180,7 @@ impl Manager {
         let (id, entry, action, opening) = match args {
             BrowserArgs::Open { url, .. } => {
                 let original = PublicUrl::parse(&url)?;
-                self.charge(context)?;
+                self.charge(context).await?;
                 self.maintenance().await?;
                 // Normal completion does not cancel the opening call token.
                 // Cancellation while returning its ID must still end the worker.
@@ -273,7 +273,7 @@ impl Manager {
         };
         let close = matches!(action, wire::Action::Close);
         if !opening && !close {
-            self.charge(context)?;
+            self.charge(context).await?;
         }
         let result = entry.session.execute(action, &context.stop).await;
         if result.is_err() && (opening || entry.session.is_closed()) {
@@ -375,7 +375,7 @@ impl Manager {
         Ok(value)
     }
 
-    fn charge(&self, context: &Context) -> Result<()> {
+    async fn charge(&self, context: &Context) -> Result<()> {
         self.ledger
             .reserve(
                 context.owner,
@@ -385,7 +385,8 @@ impl Manager {
                     ..Charge::default()
                 },
             )?
-            .finish(0, Some(0))
+            .finish_serialized(0, Some(0))
+            .await
     }
 }
 

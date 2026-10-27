@@ -92,6 +92,11 @@ explicit operator configuration. Fetching and evidence reads do not require an
 LLM. No commercial provider is selected by default; inspect configured optional
 adapters with `research_job` operation `providers`. [Providers](docs/providers.md) documents data grants and costs. The default
 Tentaflake integration leaves research summarization disabled.
+The separately provisioned, root-marked ledger guard is described in
+[Operations](docs/operations.md). NixOS guarded admission remains blocked
+pending review and deployment acceptance of its continuous host witness; existing
+unguarded behavior is unchanged. Local reservations do not replace
+provider-enforced caps or verified cost bounds.
 
 `research_job` operation `readiness` reports the authorized caller UID, effective
 policy fingerprint and the service-observed admission/egress lease without a job

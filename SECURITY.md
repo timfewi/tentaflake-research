@@ -33,6 +33,21 @@ provider or execution authority. The research client is not a general proxy.
   process/socket identity checks, controller freshness or operation-time gates.
 - Provider keys are runtime systemd credentials. Logs contain bounded categorical
   metadata; source bodies, queries and keys must not enter diagnostics.
+- The opt-in paid-ledger code requires a separately provisioned, root-owned
+  marker and lock, matching database generation and clock state, and an intact
+  persistent rollback journal. It refuses mismatches and ambiguous sidecars.
+  The sentinel is service-writable, not an authenticated database digest; a
+  privileged or service-UID writer can rewrite a coherent database and sentinel,
+  and coordinated rollback is undetectable. A proposed fixed-target unprivileged
+  host witness authenticates both Unix peers and checks host marker and state
+  directory ancestry on every admission. It stats the state directory without
+  opening it; the service validates the ledger inside its pinned directory.
+  Root-owned socket activation and host mount visibility are deployment
+  prerequisites, not properties proved by its synthetic fixtures.
+  It cannot atomically prevent a trusted host mutation during or immediately
+  after a check. NixOS guarded admission remains assertion-blocked pending review and
+  acceptance of the witness and its effective sandbox. Provider-enforced caps
+  or independently verified cost bounds remain necessary.
 
 Residual risks include kernel/browser/parser vulnerabilities, incomplete evidence,
 provider-side privacy and billing behavior, denial of service and indirect prompt

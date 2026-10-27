@@ -146,7 +146,7 @@ zeroize = { version = "1", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "stream", "json", "query", "gzip", "brotli", "deflate", "zstd"], optional = true }
 rmcp = { version = "=3.3.0", default-features = false, features = ["server", "macros", "schemars", "transport-io"] }
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
-rustix = { version = "1", features = ["fs", "net", "process", "stdio", "thread"], optional = true }
+rustix = { version = "1", features = ["event", "fs", "net", "process", "stdio", "thread"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"], optional = true }
 schemars = { version = "1", features = ["uuid1"] }
 serde = { version = "1", features = ["derive"] }

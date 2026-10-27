@@ -229,11 +229,9 @@ pub struct ProviderConfig {
     /// systemd credential name, never a request-selected path or an API key.
     pub credential: Option<String>,
     pub storage_rights: bool,
-    /// Operator-confirmed fixed price per successful request, in micro-dollars.
-    /// Absence is not a free price and cannot enable paid network work. For
-    /// token-billed summarization this is the operator's per-request ceiling,
-    /// settled in full on success; the bounded input/output limits make it a
-    /// real bound rather than an estimate.
+    /// Operator-confirmed fixed price or conservative per-request ceiling in
+    /// micro-dollars. Absence is not a free price. Spider requires a strictly
+    /// positive ceiling for either search or scrape.
     pub request_micro_usd: Option<u64>,
     /// Operator-selected model identifier for a summarization provider. Never a
     /// request parameter; absent for search/scrape adapters.
@@ -362,6 +360,13 @@ pub struct Config {
     pub version: u32,
     pub socket_path: PathBuf,
     pub state_directory: PathBuf,
+    /// Root-controlled marker for an explicitly provisioned paid ledger.
+    /// None preserves the legacy automatic initialization behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_guard_marker: Option<PathBuf>,
+    /// Exact host witness socket; required whenever the ledger guard is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_guard_witness_socket: Option<PathBuf>,
     pub egress_socket: PathBuf,
     /// Expected Unix listener peer, not the eventual worker's process UID.
     /// A root systemd socket unit retains UID 0 across FD activation.
@@ -391,6 +396,8 @@ impl Default for Config {
             version: 1,
             socket_path: "/run/agent-research/socket".into(),
             state_directory: "/var/lib/agent-research".into(),
+            ledger_guard_marker: None,
+            ledger_guard_witness_socket: None,
             egress_socket: "/run/agent-research-egress/socket".into(),
             egress_uid: None,
             egress_control_file: "/run/agent-research-egress/control/state.json".into(),
@@ -419,6 +426,29 @@ impl Config {
         if self.version != 1
             || !self.socket_path.is_absolute()
             || !self.state_directory.is_absolute()
+            || self.ledger_guard_marker.as_ref().is_some_and(|path| {
+                !path.is_absolute()
+                    || path.file_name().is_none()
+                    || path.file_name().is_some_and(|name| name == "ledger.lock")
+                    || path.starts_with(&self.state_directory)
+                    || path.components().any(|part| {
+                        !matches!(
+                            part,
+                            std::path::Component::RootDir | std::path::Component::Normal(_)
+                        )
+                    })
+            })
+            || self.ledger_guard_marker.is_some() != self.ledger_guard_witness_socket.is_some()
+            || self.ledger_guard_witness_socket.as_ref().is_some_and(|path| {
+                !path.is_absolute()
+                    || path.file_name().is_none()
+                    || path == &self.socket_path
+                    || path == &self.egress_socket
+                    || path.starts_with(&self.state_directory)
+                    || path.components().any(|part| {
+                        !matches!(part, std::path::Component::RootDir | std::path::Component::Normal(_))
+                    })
+            })
             || !self.egress_socket.is_absolute()
             || !self.egress_control_file.is_absolute()
             || self.searxng_socket.as_ref().is_some_and(|path| {
@@ -451,16 +481,12 @@ impl Config {
         {
             return Err(ErrorCode::InvalidRequest);
         }
-        const SEARCH_PROVIDERS: [&str; 3] = ["brave", "tavily", "searxng"];
+        const SEARCH_PROVIDERS: [&str; 4] = ["brave", "tavily", "searxng", "spider"];
         const SCRAPE_PROVIDERS: [&str; 2] = ["spider", "firecrawl"];
         const SUMMARIZE_PROVIDERS: [&str; 1] = ["openai"];
         for (name, provider) in &self.providers {
-            // Only implemented adapters are accepted. The search adapters are
-            // Brave, Tavily and self-hosted SearXNG; Spider and Firecrawl expose
-            // Capability::Scrape; the OpenAI-compatible adapter exposes
-            // Capability::Summarize. Additional adapters become available only
-            // with matching code and explicit capability grants, never because an
-            // environment key exists.
+            // Each adapter only accepts capabilities it actually implements.
+            // Spider supports both search and scrape, with independent grants.
             let search = SEARCH_PROVIDERS.contains(&name.as_str());
             let scrape = SCRAPE_PROVIDERS.contains(&name.as_str());
             let summarize = SUMMARIZE_PROVIDERS.contains(&name.as_str());
@@ -470,27 +496,26 @@ impl Config {
             // origin so it cannot widen the egress policy.
             let credential_less = name == "searxng";
             let configurable_endpoint = name == "searxng";
-            let expected = if search {
-                Capability::Search
-            } else if scrape {
-                Capability::Scrape
-            } else {
-                Capability::Summarize
+            let capability_supported = |capability: &Capability| match capability {
+                Capability::Search => search,
+                Capability::Scrape => scrape,
+                Capability::Summarize => summarize,
             };
             if (!search && !scrape && !summarize)
                 || provider
                     .capabilities
                     .iter()
-                    .any(|capability| *capability != expected)
+                    .any(|capability| !capability_supported(capability))
                 || (provider.enable
                     && (provider.capabilities.is_empty()
                         || (!credential_less && provider.credential.is_none())
                         || (!credential_less && provider.request_micro_usd.is_none())
-                        || (search && !provider.data.contains(&DataClass::Queries))
-                        || (scrape
+                        || (provider.capabilities.contains(&Capability::Search)
+                            && !provider.data.contains(&DataClass::Queries))
+                        || (provider.capabilities.contains(&Capability::Scrape)
                             && (!provider.data.contains(&DataClass::Urls)
                                 || !provider.data.contains(&DataClass::Content)))
-                        || (summarize
+                        || (provider.capabilities.contains(&Capability::Summarize)
                             && (!provider.data.contains(&DataClass::Content)
                                 || provider.model.is_none()))))
                 || (!configurable_endpoint && provider.endpoint.is_some())
@@ -504,6 +529,7 @@ impl Config {
                 || provider
                     .request_micro_usd
                     .is_some_and(|price| price > 1_000_000_000)
+                || (name == "spider" && provider.enable && provider.request_micro_usd == Some(0))
                 || provider
                     .credential
                     .as_ref()
@@ -517,10 +543,8 @@ impl Config {
                 return Err(ErrorCode::InvalidRequest);
             }
         }
-        // Once any provider is configured, all orders must only reference
-        // configured providers so an operator cannot silently rank one this
-        // deployment does not have. Defaults select no commercial provider. The
-        // orders are pairwise disjoint: a provider serves exactly one capability.
+        // Orders are preferences, not grants. Spider may appear in both search
+        // and scrape orders; every other cross-capability overlap stays denied.
         if self
             .search_order
             .iter()
@@ -540,10 +564,10 @@ impl Config {
                     .chain(self.scrape_order.iter())
                     .chain(self.summarize_order.iter())
                     .any(|name| !self.providers.contains_key(name)))
-            || self
-                .search_order
-                .iter()
-                .any(|name| self.scrape_order.contains(name) || self.summarize_order.contains(name))
+            || self.search_order.iter().any(|name| {
+                (name != "spider" && self.scrape_order.contains(name))
+                    || self.summarize_order.contains(name)
+            })
             || self
                 .scrape_order
                 .iter()
@@ -744,6 +768,53 @@ mod tests {
         let decoded: Config = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.egress_uid, Some(0));
         config.egress_uid = Some(u32::MAX);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn guarded_ledger_marker_is_opt_in_and_separate_from_state() {
+        let mut config = configured();
+        assert!(config.ledger_guard_marker.is_none());
+        assert!(
+            serde_json::to_value(&config)
+                .unwrap()
+                .get("ledger_guard_marker")
+                .is_none()
+        );
+        config.ledger_guard_marker = Some("/var/lib/agent-research-guard/budget.marker".into());
+        assert!(config.validate().is_err());
+        config.ledger_guard_witness_socket =
+            Some("/run/agent-research-ledger-witness/socket".into());
+        config.validate().unwrap();
+        let decoded: Config =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(decoded.ledger_guard_marker, config.ledger_guard_marker);
+        assert_eq!(
+            decoded.ledger_guard_witness_socket,
+            config.ledger_guard_witness_socket
+        );
+        for invalid in [
+            "relative/marker",
+            "/var/lib/agent-research/budget.marker",
+            "/var/lib/agent-research-guard/../budget.marker",
+            "/var/lib/agent-research-guard/ledger.lock",
+        ] {
+            config.ledger_guard_marker = Some(invalid.into());
+            assert!(config.validate().is_err());
+        }
+        config.ledger_guard_marker = Some("/var/lib/agent-research-guard/budget.marker".into());
+        for invalid in [
+            "relative/socket",
+            "/var/lib/agent-research/socket",
+            "/run/../socket",
+            "/run/agent-research/socket",
+        ] {
+            config.ledger_guard_witness_socket = Some(invalid.into());
+            assert!(config.validate().is_err());
+        }
+        config.ledger_guard_marker = None;
+        config.ledger_guard_witness_socket =
+            Some("/run/agent-research-ledger-witness/socket".into());
         assert!(config.validate().is_err());
     }
 
@@ -1046,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn scrape_and_search_orders_stay_disjoint_and_configured() {
+    fn provider_orders_reject_unsupported_or_unconfigured_names() {
         let mut config = configured();
         config
             .providers
@@ -1069,43 +1140,139 @@ mod tests {
     }
 
     #[test]
-    fn spider_is_a_scrape_provider_and_never_ranked_for_search() {
+    fn spider_orders_and_grants_are_independent() {
         let mut config = configured();
-        config.search_order = Vec::new();
-        config.providers.insert(
-            "spider".into(),
-            ProviderConfig {
-                endpoint: None,
-                credential: Some("spider".into()),
-                ..scrape_provider()
-            },
-        );
-        config.scrape_order = vec!["spider".into()];
-        config.validate().unwrap();
-        assert!(config.provider_allowed("spider", Capability::Scrape));
-        assert!(!config.provider_allowed("spider", Capability::Search));
-        // A scrape provider can never be ranked for search.
         config.search_order = vec!["spider".into()];
-        assert!(config.validate().is_err());
-        // Missing the content grant invalidates the provider entirely.
-        let mut config = configured();
-        config.search_order = Vec::new();
+        config.scrape_order = vec!["spider".into()];
         config.providers.insert(
             "spider".into(),
             ProviderConfig {
-                endpoint: None,
                 credential: Some("spider".into()),
                 ..scrape_provider()
             },
         );
+        config.validate().unwrap();
+        assert!(!config.provider_allowed("spider", Capability::Search));
+        assert!(config.provider_allowed("spider", Capability::Scrape));
+
+        let provider = config.providers.get_mut("spider").unwrap();
+        provider.capabilities = [Capability::Search].into();
+        provider.data = [DataClass::Queries].into();
+        config.validate().unwrap();
+        assert!(config.provider_allowed("spider", Capability::Search));
+        assert!(!config.provider_allowed("spider", Capability::Scrape));
+
+        let provider = config.providers.get_mut("spider").unwrap();
+        provider.capabilities.insert(Capability::Scrape);
+        provider.data.extend([DataClass::Urls, DataClass::Content]);
+        config.validate().unwrap();
+        assert!(config.provider_allowed("spider", Capability::Search));
+        assert!(config.provider_allowed("spider", Capability::Scrape));
+        for missing in [DataClass::Queries, DataClass::Urls, DataClass::Content] {
+            let mut denied = config.clone();
+            denied
+                .providers
+                .get_mut("spider")
+                .unwrap()
+                .data
+                .remove(&missing);
+            assert!(denied.validate().is_err());
+        }
+        config.providers.get_mut("spider").unwrap().enable = false;
         config
             .providers
             .get_mut("spider")
             .unwrap()
-            .data
-            .remove(&DataClass::Content);
+            .request_micro_usd = Some(0);
+        config.validate().unwrap();
+        assert!(!config.provider_allowed("spider", Capability::Search));
+        assert!(!config.provider_allowed("spider", Capability::Scrape));
+    }
+
+    #[test]
+    fn spider_pilot_configuration_validates_all_limits_and_positive_price() {
+        let mut config = configured();
+        config.privacy = Privacy::Practical;
+        config.browser.enable = false;
+        config.robots.selected_page_error_allows = false;
+        config.search_order = vec!["spider".into()];
         config.scrape_order = vec!["spider".into()];
+        config.summarize_order.clear();
+        config.limits = Limits {
+            daily_micro_usd: 1_000_000,
+            job_micro_usd: 250_000,
+            job_seconds: 300,
+            queries: 4,
+            documents: 10,
+            requests: 20,
+            job_bytes: 16 * MIB,
+            pdf_bytes: 16 * MIB,
+            active_jobs: 1,
+            ..Limits::default()
+        };
+        config.providers.insert(
+            "spider".into(),
+            ProviderConfig {
+                enable: true,
+                capabilities: [Capability::Search, Capability::Scrape].into(),
+                data: [DataClass::Queries, DataClass::Urls, DataClass::Content].into(),
+                credential: Some("spider".into()),
+                request_micro_usd: Some(125_000),
+                storage_rights: false,
+                ..ProviderConfig::default()
+            },
+        );
+        config.validate().unwrap();
+        let mut invalid = config.clone();
+        invalid.limits.pdf_bytes = invalid.limits.job_bytes + 1;
+        assert!(invalid.validate().is_err());
+        config
+            .providers
+            .get_mut("spider")
+            .unwrap()
+            .request_micro_usd = Some(0);
         assert!(config.validate().is_err());
+        // The pilot-specific two-request price ceiling is host admission policy,
+        // not a restriction on unrelated generic deployments.
+        config
+            .providers
+            .get_mut("spider")
+            .unwrap()
+            .request_micro_usd = Some(125_001);
+        config.validate().unwrap();
+        config.providers.clear();
+        config.search_order = vec!["brave".into()];
+        config.scrape_order.clear();
+        config.providers.insert(
+            "brave".into(),
+            ProviderConfig {
+                enable: true,
+                capabilities: [Capability::Search].into(),
+                data: [DataClass::Queries].into(),
+                credential: Some("brave".into()),
+                request_micro_usd: Some(0),
+                ..ProviderConfig::default()
+            },
+        );
+        config.validate().unwrap();
+        let brave = config.providers.remove("brave").unwrap();
+        config.providers.insert("tavily".into(), brave);
+        config.search_order = vec!["tavily".into()];
+        config.validate().unwrap();
+        config.providers.clear();
+        config.search_order.clear();
+        let mut firecrawl = scrape_provider();
+        firecrawl.request_micro_usd = Some(0);
+        config.providers.insert("firecrawl".into(), firecrawl);
+        config.scrape_order = vec!["firecrawl".into()];
+        config.validate().unwrap();
+        config.providers.clear();
+        config.scrape_order.clear();
+        let mut openai = summarize_provider();
+        openai.request_micro_usd = Some(0);
+        config.providers.insert("openai".into(), openai);
+        config.summarize_order = vec!["openai".into()];
+        config.validate().unwrap();
     }
 
     fn summarize_provider() -> ProviderConfig {

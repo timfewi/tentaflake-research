@@ -299,7 +299,8 @@ impl Fetcher {
                         ..Charge::default()
                     },
                 )?
-                .finish(0, Some(0))?;
+                .finish_serialized(0, Some(0))
+                .await?;
         }
         let warnings = if self
             .allowed(context, &checked.target)
@@ -413,7 +414,9 @@ impl Fetcher {
                 ..Charge::default()
             },
         )?;
-        reservation.finish(snapshot.html.len() as u64, Some(0))?;
+        reservation
+            .finish_serialized(snapshot.html.len() as u64, Some(0))
+            .await?;
         let target = PublicUrl::parse(&snapshot.metadata.url)?;
         let retrieved_at = chrono::Utc::now().timestamp();
         let mut warnings = Vec::new();
@@ -536,7 +539,8 @@ impl Fetcher {
                     ..Charge::default()
                 },
             )?
-            .finish(0, Some(0))?;
+            .finish_serialized(0, Some(0))
+            .await?;
         let key = self.key(context, target.as_str())?;
         // An archive may evict evidence earlier than the HTTP freshness window.
         // Retry initialization once after invalidation, without returning dead IDs.
@@ -776,7 +780,8 @@ impl Fetcher {
                         ..Charge::default()
                     },
                 )?
-                .finish(0, Some(0))?;
+                .finish_serialized(0, Some(0))
+                .await?;
             let parsed = parser
                 .extract(
                     context,

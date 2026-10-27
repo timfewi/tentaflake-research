@@ -11,6 +11,8 @@ check_scratch="$(mktemp -d /var/tmp/tentaflake-research-check.XXXXXX)"
 TMPDIR="$check_scratch" project-check fast
 rmdir "$check_scratch"
 cargo test --locked --offline --test service_rpc
+cargo test --locked --offline --lib budget::guard::tests
+cargo test --locked --offline --lib budget::guard::witness::tests
 ```
 
 Set `TMPDIR` after entering the pinned shell to keep per-run scratch off `/tmp`.
@@ -19,6 +21,20 @@ cache under `$XDG_CACHE_HOME/project-check/` (default `~/.cache/project-check/`)
 Without a writable user cache, it falls back to the per-run scratch directory.
 The runner removes its scratch after the check; `rmdir` removes only the empty
 owned parent. Direct Cargo commands can reuse an explicit `CARGO_TARGET_DIR`.
+
+The guarded-ledger and witness fixtures use temporary directories and synthetic
+identities; they do not run the root-only provisioning command or touch service
+state. They cover refusal, marker/sidecar consistency, held costs, host state
+and ancestor replacement, fresh challenge/peer checks, listener-descriptor
+inheritance, and two-worker responsiveness with a stalled witness. Service
+fixtures cover start/admission, egress and cancellation races, runtime teardown,
+contended receipt settlement, worker failure and independent evidence cleanup.
+They do not recreate a real systemd bind mount. Same-UID test processes cannot establish
+that a root-created systemd socket passed to a different unprivileged witness UID
+actually presents root peer credentials, nor prove host mount visibility,
+sandboxing or power-loss behavior. NixOS guarded
+admission stays blocked until those properties have been independently reviewed
+and accepted on the intended host.
 
 The fast gate runs Rust formatting, all-target/all-feature Clippy with warnings
 denied, client-only and default-feature tests, Nix lints/formatting and ShellCheck.

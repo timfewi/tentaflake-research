@@ -563,7 +563,9 @@ impl ProtectedHttp {
                 // when a stream terminates unexpectedly (Reservation::drop).
                 return Err(ErrorCode::InvalidResponse);
             }
-            reservation.finish(body.len() as u64 + outgoing_bytes, cost)?;
+            reservation
+                .finish_serialized(body.len() as u64 + outgoing_bytes, cost)
+                .await?;
             if body.len() as u64 > maximum {
                 return Err(ErrorCode::SizeLimit);
             }
@@ -1219,6 +1221,29 @@ mod tests {
         assert_eq!(usage.used_bytes, 5);
         assert_eq!(usage.held_micro_usd, 5000);
         assert_eq!(usage.known_micro_usd, 0);
+    }
+
+    #[tokio::test]
+    async fn successful_provider_status_is_settled_when_the_body_fails() {
+        let (_root, http, ledger, server) = fixture(
+            1,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nxy",
+            false,
+        )
+        .await;
+        let job = ledger.start(1001, RequestedLimits::default()).unwrap();
+        let mut request = request();
+        request.micro_usd = 5000;
+        assert!(matches!(
+            http.get(1001, job.id, request, &CancellationToken::new())
+                .await,
+            Err(ErrorCode::InvalidResponse)
+        ));
+        assert_eq!(server.await.unwrap().len(), 1);
+        ledger.flush_serialized().await.unwrap();
+        let usage = ledger.get(1001, job.id).unwrap().usage;
+        assert_eq!((usage.used_bytes, usage.reserved_bytes), (65, 0));
+        assert_eq!((usage.known_micro_usd, usage.held_micro_usd), (5000, 0));
     }
 
     #[tokio::test]

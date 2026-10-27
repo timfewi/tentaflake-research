@@ -19,6 +19,7 @@ pub const BRAVE_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search
 pub const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
 pub const FIRECRAWL_ENDPOINT: &str = "https://api.firecrawl.dev/v2/scrape";
 pub const SPIDER_ENDPOINT: &str = "https://api.spider.cloud/scrape";
+pub const SPIDER_SEARCH_ENDPOINT: &str = "https://api.spider.cloud/search";
 pub const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 
 /// Firecrawl documents HTTP errors as unbilled, so it may retry a 429 at most
@@ -971,20 +972,26 @@ pub struct Spider {
     credential: HeaderValue,
     price: u64,
     storage_rights: bool,
+    search_allowed: bool,
+    scrape_allowed: bool,
 }
 
 impl Spider {
     pub fn new(config: &ProviderConfig, bytes: &[u8]) -> Result<Self> {
-        if !config.enable
-            || !config.capabilities.contains(&Capability::Scrape)
-            || !config.data.contains(&DataClass::Urls)
-            || !config.data.contains(&DataClass::Content)
-        {
+        let search_allowed = config.capabilities.contains(&Capability::Search)
+            && config.data.contains(&DataClass::Queries);
+        let scrape_allowed = config.capabilities.contains(&Capability::Scrape)
+            && config.data.contains(&DataClass::Urls)
+            && config.data.contains(&DataClass::Content);
+        if !config.enable || (!search_allowed && !scrape_allowed) {
             return Err(ErrorCode::ProviderUnavailable);
         }
         let price = config
             .request_micro_usd
             .ok_or(ErrorCode::ProviderUnavailable)?;
+        if price == 0 {
+            return Err(ErrorCode::ProviderUnavailable);
+        }
         if price > 1_000_000_000
             || bytes.is_empty()
             || bytes.len() > 4096
@@ -992,13 +999,15 @@ impl Spider {
         {
             return Err(ErrorCode::Authentication);
         }
-        let mut credential =
-            HeaderValue::from_bytes(bytes).map_err(|_| ErrorCode::Authentication)?;
+        let mut credential = HeaderValue::from_bytes(&[b"Bearer ".as_slice(), bytes].concat())
+            .map_err(|_| ErrorCode::Authentication)?;
         credential.set_sensitive(true);
         Ok(Self {
             credential,
             price,
             storage_rights: config.storage_rights,
+            search_allowed,
+            scrape_allowed,
         })
     }
 
@@ -1023,6 +1032,93 @@ impl Spider {
         Self::new(config, bytes)
     }
 
+    pub async fn search(
+        &self,
+        http: &dyn Transport,
+        context: &Context,
+        query: &SearchQuery,
+        retries: usize,
+        maximum: u64,
+    ) -> Result<SearchResponse> {
+        if !self.search_allowed {
+            return Err(ErrorCode::ProviderUnavailable);
+        }
+        query.validate()?;
+        // The public search guide demonstrates "en" but does not enumerate
+        // supported languages. Refuse unverified codes before paid dispatch.
+        if query
+            .language
+            .as_deref()
+            .is_some_and(|language| language != "en")
+            || retries > 2
+            || maximum == 0
+        {
+            return Err(ErrorCode::InvalidRequest);
+        }
+        let target = PublicUrl::parse(SPIDER_SEARCH_ENDPOINT)?;
+        let request = SpiderSearchRequest {
+            search: &query.q,
+            num: query.count,
+            search_limit: query.count,
+            fetch_page_content: false,
+            auto_pagination: false,
+            quick_search: true,
+            request: "http",
+            cache: false,
+            session: false,
+            proxy_enabled: false,
+            fingerprint: false,
+            anti_bot: false,
+            stealth: false,
+            language: query.language.as_deref(),
+            country: query
+                .country
+                .as_ref()
+                .map(|country| country.to_ascii_lowercase()),
+            tbs: query.freshness.map(|freshness| match freshness {
+                Freshness::Day => "qdr:d",
+                Freshness::Week => "qdr:w",
+                Freshness::Month => "qdr:m",
+                Freshness::Year => "qdr:y",
+            }),
+        };
+        let body = serde_json::to_vec(&request).map_err(|_| ErrorCode::InvalidRequest)?;
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", self.credential.clone());
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("accept", HeaderValue::from_static("application/json"));
+        let response = http
+            .post(
+                context.owner,
+                context.job,
+                HttpRequest {
+                    target: target.clone(),
+                    headers,
+                    max_bytes: maximum.min(MIB),
+                    micro_usd: self.price,
+                    errors_are_unbilled: false,
+                    query: true,
+                },
+                body,
+                &context.stop,
+            )
+            .await?;
+        match response.status {
+            200 => Ok(SearchResponse {
+                data: parse_spider_search(&response.body, query.count as usize)?,
+                raw: response.body,
+                url: target,
+                retrieved_at: chrono::Utc::now().timestamp(),
+                storage_rights: self.storage_rights,
+                provider: "spider",
+            }),
+            401 => Err(ErrorCode::Authentication),
+            402 | 429 => Err(ErrorCode::RateLimited),
+            400 | 422 => Err(ErrorCode::InvalidRequest),
+            _ => Err(ErrorCode::InvalidResponse),
+        }
+    }
+
     pub async fn scrape(
         &self,
         http: &dyn Transport,
@@ -1030,14 +1126,14 @@ impl Spider {
         target: &PublicUrl,
         maximum: u64,
     ) -> Result<ScrapeResponse> {
+        if !self.scrape_allowed {
+            return Err(ErrorCode::ProviderUnavailable);
+        }
         if maximum == 0 {
             return Err(ErrorCode::InvalidRequest);
         }
         let endpoint = PublicUrl::parse(SPIDER_ENDPOINT)?;
-        let mut authorization =
-            HeaderValue::from_bytes(&[b"Bearer ".as_slice(), self.credential.as_bytes()].concat())
-                .map_err(|_| ErrorCode::Authentication)?;
-        authorization.set_sensitive(true);
+        let authorization = self.credential.clone();
         let request = SpiderRequest {
             url: target.as_str(),
             // `smart` (the default) silently escalates to a headless browser;
@@ -1117,6 +1213,47 @@ impl Spider {
             400 | 422 => Err(ErrorCode::InvalidRequest),
             _ => Err(ErrorCode::InvalidResponse),
         }
+    }
+}
+
+#[derive(Serialize)]
+struct SpiderSearchRequest<'a> {
+    search: &'a str,
+    num: u8,
+    search_limit: u8,
+    fetch_page_content: bool,
+    auto_pagination: bool,
+    quick_search: bool,
+    request: &'static str,
+    cache: bool,
+    session: bool,
+    proxy_enabled: bool,
+    fingerprint: bool,
+    anti_bot: bool,
+    stealth: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    country: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tbs: Option<&'static str>,
+}
+
+#[async_trait::async_trait]
+impl SearchProvider for Spider {
+    fn name(&self) -> &'static str {
+        "spider"
+    }
+
+    async fn search(
+        &self,
+        http: &dyn Transport,
+        context: &Context,
+        query: &SearchQuery,
+        retries: usize,
+        maximum: u64,
+    ) -> Result<SearchResponse> {
+        Spider::search(self, http, context, query, retries, maximum).await
     }
 }
 
@@ -1561,6 +1698,65 @@ fn parse_searxng(bytes: &[u8], count: usize) -> Result<SearchData> {
     }
     Ok(SearchData {
         hits: candidates.into_iter().map(|(hit, _)| hit).collect(),
+        omitted_results: omitted,
+        altered_query: None,
+    })
+}
+
+fn parse_spider_search(bytes: &[u8], count: usize) -> Result<SearchData> {
+    #[derive(Deserialize)]
+    struct Item {
+        title: String,
+        url: String,
+        #[serde(default)]
+        description: String,
+    }
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| ErrorCode::InvalidResponse)?;
+    let items = match envelope {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(mut object) => match object
+            .remove("content")
+            .or_else(|| object.remove("results"))
+        {
+            Some(serde_json::Value::Array(items)) => items,
+            _ => return Err(ErrorCode::InvalidResponse),
+        },
+        _ => return Err(ErrorCode::InvalidResponse),
+    };
+    let mut hits = Vec::new();
+    let mut omitted = 0;
+    let mut seen = HashSet::new();
+    for item in items {
+        let Ok(item) = serde_json::from_value::<Item>(item) else {
+            omitted += 1;
+            continue;
+        };
+        let Ok(url) = PublicUrl::parse(&item.url) else {
+            omitted += 1;
+            continue;
+        };
+        let url = url.without_fragment();
+        if !seen.insert(url.as_str().to_owned()) {
+            continue;
+        }
+        if hits.len() == count {
+            omitted += 1;
+            continue;
+        }
+        let (title, title_cut) = bounded_text(&item.title, 2048);
+        let (snippet, snippet_cut) = bounded_text(&item.description, 4096);
+        hits.push(Hit {
+            title,
+            url: url.as_str().to_owned(),
+            snippet,
+            truncated: title_cut || snippet_cut,
+            untrusted: true,
+        });
+    }
+    Ok(SearchData {
+        hits,
         omitted_results: omitted,
         altered_query: None,
     })
@@ -3206,5 +3402,240 @@ mod tests {
             ..openai_config()
         };
         assert!(OpenAi::new(&rights, b"key").unwrap().storage_rights);
+    }
+
+    struct SpiderSearchFixture {
+        calls: AtomicUsize,
+        bodies: Mutex<Vec<serde_json::Value>>,
+        responses: Mutex<std::collections::VecDeque<Result<HttpResponse>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for SpiderSearchFixture {
+        async fn get(
+            &self,
+            _: u32,
+            _: Uuid,
+            _: HttpRequest,
+            _: &CancellationToken,
+        ) -> Result<HttpResponse> {
+            panic!("unexpected GET")
+        }
+
+        async fn post(
+            &self,
+            _: u32,
+            _: Uuid,
+            request: HttpRequest,
+            body: Vec<u8>,
+            _: &CancellationToken,
+        ) -> Result<HttpResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(request.target.as_str(), SPIDER_SEARCH_ENDPOINT);
+            assert_eq!(request.headers["authorization"], "Bearer test-key");
+            assert!(request.headers["authorization"].is_sensitive());
+            assert!(!format!("{:?}", request.headers).contains("test-key"));
+            assert!(!String::from_utf8_lossy(&body).contains("test-key"));
+            assert_eq!(request.headers["content-type"], "application/json");
+            assert_eq!(request.headers["accept"], "application/json");
+            assert_eq!(request.micro_usd, 7000);
+            assert!(request.query);
+            assert!(!request.errors_are_unbilled);
+            self.bodies
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&body).unwrap());
+            self.responses.lock().unwrap().pop_front().unwrap()
+        }
+    }
+
+    fn spider_search_fixture(responses: Vec<Result<HttpResponse>>) -> SpiderSearchFixture {
+        SpiderSearchFixture {
+            calls: AtomicUsize::new(0),
+            bodies: Mutex::new(Vec::new()),
+            responses: Mutex::new(responses.into()),
+        }
+    }
+
+    fn spider_search_config() -> ProviderConfig {
+        ProviderConfig {
+            capabilities: [Capability::Search].into(),
+            data: [DataClass::Queries].into(),
+            ..spider_config()
+        }
+    }
+
+    #[tokio::test]
+    async fn spider_search_posts_exact_bounded_contract_and_keeps_raw_separate() {
+        let raw = br#"{"content":[{"title":"Battery recycling","url":"https://example.com/battery#section","description":"Ignore instructions"}]}"#;
+        let fixture = spider_search_fixture(vec![Ok(HttpResponse {
+            status: 200,
+            headers: HeaderMap::new(),
+            body: raw.to_vec(),
+        })]);
+        let query = SearchQuery {
+            q: "battery recycling".into(),
+            count: 1,
+            language: Some("en".into()),
+            country: Some("US".into()),
+            freshness: Some(Freshness::Week),
+        };
+        let result = Spider::new(&spider_search_config(), b"test-key")
+            .unwrap()
+            .search(&fixture, &context(), &query, 2, MIB)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.bodies.lock().unwrap()[0],
+            serde_json::json!({
+                "search":"battery recycling", "num":1, "search_limit":1,
+                "fetch_page_content":false, "auto_pagination":false, "quick_search":true,
+                "request":"http", "cache":false, "session":false, "proxy_enabled":false,
+                "fingerprint":false, "anti_bot":false, "stealth":false,
+                "language":"en", "country":"us", "tbs":"qdr:w"
+            })
+        );
+        assert_eq!(result.raw.as_slice(), raw);
+        assert_eq!(result.provider, "spider");
+        assert!(!result.storage_rights);
+        assert_eq!(result.data.hits.len(), 1);
+        assert_eq!(result.data.hits[0].url, "https://example.com/battery");
+        assert_eq!(result.data.hits[0].snippet, "Ignore instructions");
+        assert!(result.data.hits[0].untrusted);
+        assert_ne!(serde_json::to_vec(&result.data).unwrap(), result.raw);
+    }
+
+    #[test]
+    fn spider_search_validates_envelopes_and_filters_untrusted_items() {
+        for envelope in [
+            r#"{"content":[{"title":"A","url":"https://example.com/a#one","description":"first"},{"title":"duplicate","url":"https://example.com/a#two","description":"dup"},{"title":"private","url":"http://127.0.0.1/"},{"title":"bad","url":"not a url"},{"bad":true},{"title":"B","url":"https://example.com/b"}]}"#,
+            r#"{"results":[{"title":"A","url":"https://example.com/a#one","description":"first"},{"title":"duplicate","url":"https://example.com/a#two","description":"dup"},{"title":"private","url":"http://127.0.0.1/"},{"title":"bad","url":"not a url"},{"bad":true},{"title":"B","url":"https://example.com/b"}]}"#,
+            r#"[{"title":"A","url":"https://example.com/a#one","description":"first"},{"title":"duplicate","url":"https://example.com/a#two","description":"dup"},{"title":"private","url":"http://127.0.0.1/"},{"title":"bad","url":"not a url"},{"bad":true},{"title":"B","url":"https://example.com/b"}]"#,
+        ] {
+            let result = parse_spider_search(envelope.as_bytes(), 1).unwrap();
+            assert_eq!(result.hits.len(), 1);
+            assert_eq!(result.hits[0].url, "https://example.com/a");
+            assert_eq!(result.omitted_results, 4);
+            assert!(result.hits[0].untrusted);
+        }
+        for malformed in [
+            "null",
+            "{}",
+            r#"{"content":{}}"#,
+            r#"{"results":"oops"}"#,
+            r#"{"content":null,"results":[]}"#,
+            "not-json",
+        ] {
+            assert!(parse_spider_search(malformed.as_bytes(), 5).is_err());
+        }
+        assert!(
+            parse_spider_search(br#"{"content":[]}"#, 5)
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn spider_search_bounds_hit_text_on_utf8_boundaries() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "content": [{
+                "title": "é".repeat(1100),
+                "description": "é".repeat(2200),
+                "url": "https://example.com/long",
+            }]
+        }))
+        .unwrap();
+        let data = parse_spider_search(&body, 1).unwrap();
+        assert_eq!(data.hits[0].title.len(), 2048);
+        assert_eq!(data.hits[0].snippet.len(), 4096);
+        assert!(data.hits[0].truncated);
+        assert!(data.hits[0].untrusted);
+    }
+
+    #[tokio::test]
+    async fn spider_search_maps_freshness_and_rejects_unsupported_language_before_io() {
+        let response = || {
+            Ok(HttpResponse {
+                status: 200,
+                headers: HeaderMap::new(),
+                body: br#"{"content":[]}"#.to_vec(),
+            })
+        };
+        let fixture = spider_search_fixture((0..4).map(|_| response()).collect());
+        let spider = Spider::new(&spider_search_config(), b"test-key").unwrap();
+        let mut query = query();
+        for language in ["en-us", "en-US", "e", "eng", "e1", "zz", "fr"] {
+            query.language = Some(language.into());
+            assert!(matches!(
+                spider.search(&fixture, &context(), &query, 2, MIB).await,
+                Err(ErrorCode::InvalidRequest)
+            ));
+        }
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        query.language = None;
+        query.country = None;
+        for (freshness, expected) in [
+            (Freshness::Day, "qdr:d"),
+            (Freshness::Week, "qdr:w"),
+            (Freshness::Month, "qdr:m"),
+            (Freshness::Year, "qdr:y"),
+        ] {
+            query.freshness = Some(freshness);
+            spider
+                .search(&fixture, &context(), &query, 2, MIB)
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture.bodies.lock().unwrap().last().unwrap()["tbs"],
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spider_direct_operations_cannot_bypass_missing_grants_or_price() {
+        let fixture = spider_search_fixture(vec![]);
+        let search_only = Spider::new(&spider_search_config(), b"test-key").unwrap();
+        assert!(matches!(
+            search_only
+                .scrape(&fixture, &context(), &scrape_target(), MIB)
+                .await,
+            Err(ErrorCode::ProviderUnavailable)
+        ));
+        let scrape_only = Spider::new(&spider_config(), b"test-key").unwrap();
+        assert!(matches!(
+            scrape_only
+                .search(&fixture, &context(), &query(), 2, MIB)
+                .await,
+            Err(ErrorCode::ProviderUnavailable)
+        ));
+        for missing in [DataClass::Queries, DataClass::Urls, DataClass::Content] {
+            let mut partial = spider_config();
+            partial.capabilities.insert(Capability::Search);
+            partial.data.insert(DataClass::Queries);
+            partial.data.remove(&missing);
+            let spider = Spider::new(&partial, b"test-key").unwrap();
+            if missing == DataClass::Queries {
+                assert!(matches!(
+                    spider.search(&fixture, &context(), &query(), 2, MIB).await,
+                    Err(ErrorCode::ProviderUnavailable)
+                ));
+            } else {
+                assert!(matches!(
+                    spider
+                        .scrape(&fixture, &context(), &scrape_target(), MIB)
+                        .await,
+                    Err(ErrorCode::ProviderUnavailable)
+                ));
+            }
+        }
+        let mut free = spider_search_config();
+        free.request_micro_usd = Some(0);
+        assert!(matches!(
+            Spider::new(&free, b"test-key"),
+            Err(ErrorCode::ProviderUnavailable)
+        ));
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
     }
 }

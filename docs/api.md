@@ -33,8 +33,8 @@ Identical batch inputs share work and retain their original indexes with
 `duplicate_of`. Coverage separately counts success, empty, partial, failed and
 skipped items. A failed query alongside an empty query is not complete emptiness.
 
-`research_search` follows the configured `search_order` (SearXNG, Brave, Tavily): the first
-granted provider is preferred, and only unambiguous failures (unavailable,
+`research_search` follows the configured `search_order` (SearXNG, Brave, Tavily
+or Spider): the first granted provider is preferred, and only unambiguous failures (unavailable,
 authentication, rate limit, invalid response) fall through to the next. Uncertain
 charges, policy/access blocks and budget limits are never replayed across
 providers. The result names the provider that answered.
@@ -157,6 +157,8 @@ provider call, so an access block is never bypassed. The result names the
 provider and keeps the raw provider JSON and the derived text as separate
 representations. Strict privacy disables scrape providers; an unavailable or
 unconfigured provider returns `provider_unavailable`.
+Provider fetch consumes one document per selected item before the robots check,
+regardless of provider retries or fallback; zero document budget admits none.
 
 `crawl` is an optional object, `{"pages": <1..=32>, "depth": <0..=4>}`, and is
 valid only with `mode` `http` or `auto` (with `browser` or `provider` it is

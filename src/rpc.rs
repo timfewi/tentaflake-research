@@ -5,7 +5,7 @@ use crate::diagnostics::{self, Component, Event};
 use crate::egress::{EgressMode, EgressState, control_state_diagnostic};
 use crate::error::{ErrorCode, Result};
 use crate::protocol::{self, Operation, Outcome, Request, Response, VERSION};
-use crate::service::Service;
+use crate::service::{CleanupSupervisor, Service};
 use crate::socket;
 use serde_json::json;
 use std::collections::HashMap;
@@ -24,8 +24,23 @@ pub async fn serve(
     control: &Path,
     stop: CancellationToken,
 ) -> Result<()> {
+    serve_with_control(listener, service, control, stop, control_state_diagnostic).await
+}
+
+pub(crate) async fn serve_with_control<F>(
+    listener: UnixListener,
+    service: Arc<Service>,
+    control: &Path,
+    stop: CancellationToken,
+    mut read_control: F,
+) -> Result<()>
+where
+    F: FnMut(&Path) -> std::result::Result<EgressState, crate::egress::LeaseReadError> + Send,
+{
     let slots = Arc::new(Semaphore::new(service.limits().rpc_connections));
     let mut connections = JoinSet::new();
+    let mut cleanup = CleanupSupervisor::new(service.limits().active_jobs);
+    let mut maintenance_tasks = JoinSet::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut maintenance = tokio::time::interval(Duration::from_secs(60));
     let mut control_issue = None;
@@ -33,11 +48,22 @@ pub async fn serve(
     let result = loop {
         tokio::select! {
             _ = stop.cancelled() => break Ok(()),
-            _ = maintenance.tick() => {
-                if let Err(error) = service.maintenance().await { break Err(error); }
+            _ = maintenance.tick(), if maintenance_tasks.is_empty() => {
+                let service = service.clone();
+                maintenance_tasks.spawn(async move { service.maintenance().await });
+            }
+            Some(result) = maintenance_tasks.join_next(), if !maintenance_tasks.is_empty() => {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => break Err(error),
+                    Err(_) => break Err(ErrorCode::WorkerFailed),
+                }
+            }
+            result = cleanup.next(), if !cleanup.is_empty() => {
+                if let Err(error) = result { break Err(error); }
             }
             _ = tick.tick() => {
-                let state = match control_state_diagnostic(control) {
+                let state = match read_control(control) {
                     Ok(state) => {
                         control_issue = None;
                         if state.mode != EgressMode::Offline {
@@ -56,8 +82,8 @@ pub async fn serve(
                         EgressState::offline()
                     }
                 };
-                if let Err(error) = service.update_egress(state).await { break Err(error); }
-                if let Err(error) = service.expire().await { break Err(error); }
+                if let Err(error) = service.observe_egress(state, &mut cleanup) { break Err(error); }
+                if let Err(error) = service.observe_expiry(&mut cleanup) { break Err(error); }
             }
             accepted = listener.accept() => {
                 let (socket, _) = match accepted { Ok(pair) => pair, Err(_) => break Err(ErrorCode::WorkerFailed) };
@@ -72,8 +98,23 @@ pub async fn serve(
         }
     };
     stop.cancel();
-    while connections.join_next().await.is_some() {}
-    service.shutdown().await?;
+    // Start service shutdown before joining connections: both may be waiting
+    // for the same stalled start, and shutdown must invalidate it immediately.
+    let mut result = result.and(service.shutdown().await);
+    while let Some(connection) = connections.join_next().await {
+        if connection.is_err() {
+            result = result.and(Err(ErrorCode::WorkerFailed));
+        }
+    }
+    while !cleanup.is_empty() {
+        result = result.and(cleanup.next().await);
+    }
+    while let Some(maintenance) = maintenance_tasks.join_next().await {
+        let outcome = maintenance
+            .map_err(|_| ErrorCode::WorkerFailed)
+            .and_then(|value| value);
+        result = result.and(outcome);
+    }
     result
 }
 

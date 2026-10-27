@@ -12,8 +12,12 @@ let
   runtimePath = types.strMatching "/[a-zA-Z0-9_./-]+";
   serviceUid = if cfg.serviceUid == null then 1 else cfg.serviceUid;
   egressUid = if cfg.egressUid == null then 2 else cfg.egressUid;
+  witnessUid = if cfg.guardedLedger.witnessUid == null then 3 else cfg.guardedLedger.witnessUid;
   interface = if cfg.vpnInterface == null then "unconfigured0" else cfg.vpnInterface;
   observationDirectory = builtins.dirOf cfg.observationFile;
+  ledgerMarkerDirectory = builtins.dirOf cfg.guardedLedger.markerPath;
+  ledgerWitnessDirectory = "/run/agent-research-ledger-witness";
+  ledgerWitnessSocket = "${ledgerWitnessDirectory}/socket";
   socket = "/run/agent-research/socket";
   egressSocket = "/run/agent-research-egress/socket";
   controlDirectory = "/run/agent-research-egress/control";
@@ -62,6 +66,8 @@ let
       version = 1;
       socket_path = socket;
       state_directory = "/var/lib/agent-research";
+      ledger_guard_marker = if cfg.guardedLedger.enable then cfg.guardedLedger.markerPath else null;
+      ledger_guard_witness_socket = if cfg.guardedLedger.enable then ledgerWitnessSocket else null;
       egress_socket = egressSocket;
       # SO_PEERCRED reports the root socket creator across systemd activation,
       # not the unprivileged process accepting the inherited descriptor.
@@ -140,6 +146,11 @@ let
     name: paths:
     pkgs.runCommand "research-${name}-root" { } ''
       mkdir -p "$out"/{dev/shm,proc,sys,tmp,var/tmp,var/lib/agent-research,etc/research,nix/store}
+      ${lib.optionalString cfg.guardedLedger.enable ''mkdir -p "$out${ledgerMarkerDirectory}"''}
+      ${lib.optionalString cfg.guardedLedger.enable ''
+        mkdir -p "$out${ledgerWitnessDirectory}"
+        touch "$out${ledgerWitnessSocket}"
+      ''}
       mkdir -p "$out/run/agent-research" "$out/run/agent-research-searxng" "$out${controlDirectory}" \
         "$out/run/credentials/agent-research.service" "$out${observationDirectory}"
       touch "$out/etc/research/config.json"
@@ -208,7 +219,7 @@ let
       requestMicroUsd = mkOption {
         type = types.nullOr (types.ints.between 0 1000000000);
         default = null;
-        description = "Fixed per-request price, or for summarization the per-request ceiling settled on success.";
+        description = "Fixed per-request price or conservative ceiling; Spider requires a positive ceiling for each search or scrape request.";
       };
       model = mkOption {
         type = types.nullOr (types.strMatching "[A-Za-z0-9_.:/-]{1,128}");
@@ -237,6 +248,19 @@ in
     egressPackage = mkOption {
       type = types.package;
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.research-egress;
+    };
+    guardedLedger = {
+      enable = mkEnableOption "a separately provisioned, root-marked paid ledger";
+      witnessUid = mkOption {
+        type = types.nullOr uidType;
+        default = null;
+        description = "Explicit dedicated host UID/GID for the unprivileged ledger witness; never shared with the service, egress, clients or other configured identities.";
+      };
+      markerPath = mkOption {
+        type = runtimePath;
+        default = "/var/lib/agent-research-guard/budget.marker";
+        description = "Non-secret root-controlled persistent marker, outside the service state directory. The marker and its directories are never created by the service.";
+      };
     };
     serviceUid = mkOption {
       type = types.nullOr uidType;
@@ -373,6 +397,7 @@ in
           "brave"
           "tavily"
           "searxng"
+          "spider"
         ]
       );
       default = if cfg.searxng.enable then [ "searxng" ] else [ ];
@@ -494,6 +519,42 @@ in
           }
           {
             assertion =
+              !cfg.guardedLedger.enable
+              || (
+                cfg.guardedLedger.witnessUid != null
+                && witnessUid != serviceUid
+                && witnessUid != egressUid
+                && !(builtins.elem witnessUid (builtins.attrValues cfg.clients))
+                && cfg.socketGroup != "agent-research-ledger-witness"
+              );
+            message = "Guarded Research requires an explicit dedicated non-root witness UID/GID.";
+          }
+          {
+            assertion =
+              !cfg.guardedLedger.enable
+              || (
+                lib.hasPrefix "/var/lib/" cfg.guardedLedger.markerPath
+                && ledgerMarkerDirectory != "/var/lib"
+                && ledgerMarkerDirectory != "/var/lib/agent-research"
+                && builtins.baseNameOf cfg.guardedLedger.markerPath != "ledger.lock"
+                && !(lib.hasPrefix "/var/lib/agent-research/" cfg.guardedLedger.markerPath)
+                && builtins.all (
+                  part:
+                  !(builtins.elem part [
+                    ""
+                    "."
+                    ".."
+                  ])
+                ) (builtins.tail (lib.splitString "/" cfg.guardedLedger.markerPath))
+              );
+            message = "The guarded ledger marker must use a normalized, separate persistent directory under /var/lib.";
+          }
+          {
+            assertion = !cfg.guardedLedger.enable;
+            message = "Guarded Research admission is blocked pending continuous host witness review and verification.";
+          }
+          {
+            assertion =
               cfg.clients != { }
               && builtins.all (uid: uid != serviceUid && uid != egressUid) (builtins.attrValues cfg.clients);
             message = "Research requires clients distinct from its service identities.";
@@ -578,7 +639,7 @@ in
                 "openai"
               ]
             ) (builtins.attrNames cfg.providers);
-            message = "Only Brave/Tavily/SearXNG (search), Spider/Firecrawl (scrape) and OpenAI (summarize) are currently implemented; new providers need their own adapter and grants.";
+            message = "Only Brave/Tavily/SearXNG/Spider (search), Spider/Firecrawl (scrape) and OpenAI (summarize) are currently implemented; new providers need their own adapter and grants.";
           }
         ]
         ++ lib.mapAttrsToList (name: provider: {
@@ -594,25 +655,40 @@ in
                   else
                     provider.apiKeyFile != null && provider.requestMicroUsd != null && provider.endpoint == null
                 )
+                && provider.capabilities != [ ]
+                && (!(builtins.elem "search" provider.capabilities) || builtins.elem "queries" provider.data)
                 && (
-                  if
-                    builtins.elem name [
-                      "brave"
-                      "tavily"
-                      "searxng"
-                    ]
-                  then
-                    builtins.elem "search" provider.capabilities && builtins.elem "queries" provider.data
-                  else if name == "openai" then
-                    builtins.elem "summarize" provider.capabilities
-                    && builtins.elem "content" provider.data
-                    && provider.model != null
-                  else
-                    builtins.elem "scrape" provider.capabilities
-                    && builtins.elem "urls" provider.data
-                    && builtins.elem "content" provider.data
+                  !(builtins.elem "scrape" provider.capabilities)
+                  || (builtins.elem "urls" provider.data && builtins.elem "content" provider.data)
+                )
+                && (
+                  !(builtins.elem "summarize" provider.capabilities)
+                  || (builtins.elem "content" provider.data && provider.model != null)
                 )
               )
+            )
+            && builtins.all (
+              capability:
+              if capability == "search" then
+                builtins.elem name [
+                  "brave"
+                  "tavily"
+                  "searxng"
+                  "spider"
+                ]
+              else if capability == "scrape" then
+                builtins.elem name [
+                  "spider"
+                  "firecrawl"
+                ]
+              else
+                name == "openai"
+            ) provider.capabilities
+            && (
+              name != "spider"
+              || !provider.enable
+              || provider.requestMicroUsd == null
+              || provider.requestMicroUsd > 0
             )
             && (provider.model == null || name == "openai")
             && (provider.apiKeyFile == null || !(lib.hasPrefix "/nix/store/" provider.apiKeyFile));
@@ -620,26 +696,38 @@ in
         }) cfg.providers
         ++ lib.mapAttrsToList (name: user: {
           assertion =
-            builtins.elem name [
-              "agent-research"
-              "agent-research-egress"
-            ]
-            || !(builtins.elem user.uid [
-              serviceUid
-              egressUid
-            ]);
+            builtins.elem name (
+              [
+                "agent-research"
+                "agent-research-egress"
+              ]
+              ++ lib.optional cfg.guardedLedger.enable "agent-research-ledger-witness"
+            )
+            || !(builtins.elem user.uid (
+              [
+                serviceUid
+                egressUid
+              ]
+              ++ lib.optional cfg.guardedLedger.enable witnessUid
+            ));
           message = "Research service UID collides with another configured user.";
         }) config.users.users
         ++ lib.mapAttrsToList (name: group: {
           assertion =
-            builtins.elem name [
-              "agent-research"
-              "agent-research-egress"
-            ]
-            || !(builtins.elem group.gid [
-              serviceUid
-              egressUid
-            ]);
+            builtins.elem name (
+              [
+                "agent-research"
+                "agent-research-egress"
+              ]
+              ++ lib.optional cfg.guardedLedger.enable "agent-research-ledger-witness"
+            )
+            || !(builtins.elem group.gid (
+              [
+                serviceUid
+                egressUid
+              ]
+              ++ lib.optional cfg.guardedLedger.enable witnessUid
+            ));
           message = "Research service GID collides with another configured group.";
         }) config.users.groups;
 
@@ -647,6 +735,9 @@ in
           agent-research.gid = serviceUid;
           agent-research-egress.gid = egressUid;
           ${cfg.socketGroup} = { };
+        }
+        // lib.optionalAttrs cfg.guardedLedger.enable {
+          agent-research-ledger-witness.gid = witnessUid;
         };
         users.users = {
           agent-research = {
@@ -659,12 +750,20 @@ in
             group = "agent-research-egress";
             isSystemUser = true;
           };
+        }
+        // lib.optionalAttrs cfg.guardedLedger.enable {
+          agent-research-ledger-witness = {
+            uid = witnessUid;
+            group = "agent-research-ledger-witness";
+            isSystemUser = true;
+          };
         };
         systemd.tmpfiles.rules = [
           "d /run/agent-research 0755 root root -"
           "d /run/agent-research-egress 0755 root root -"
           "d ${controlDirectory} 0755 root root -"
-        ];
+        ]
+        ++ lib.optional cfg.guardedLedger.enable "d ${ledgerWitnessDirectory} 0755 root root -";
         environment.etc."systemd/journald@${journalNamespace}.conf".text = ''
           [Journal]
           Storage=volatile
@@ -691,6 +790,16 @@ in
               RemoveOnStop = true;
             };
           };
+          agent-research-ledger-witness = lib.mkIf cfg.guardedLedger.enable {
+            listenStreams = [ ledgerWitnessSocket ];
+            socketConfig = {
+              SocketUser = "root";
+              SocketGroup = "agent-research";
+              SocketMode = "0660";
+              DirectoryMode = "0755";
+              RemoveOnStop = true;
+            };
+          };
           agent-research-egress = {
             wantedBy = [ "sockets.target" ];
             listenStreams = [ egressSocket ];
@@ -712,17 +821,70 @@ in
             # Storage=volatile unless this directive is cleared for our instance.
             serviceConfig.LogsDirectory = "";
           };
+          agent-research-ledger-check = lib.mkIf cfg.guardedLedger.enable {
+            description = "Check Research ledger marker on the real host path";
+            serviceConfig = common // {
+              Type = "oneshot";
+              User = "root";
+              Group = "root";
+              ExecStart = "${cfg.package}/bin/research-service --check-ledger-guard --ledger-marker ${cfg.guardedLedger.markerPath}";
+              Restart = "no";
+              PrivateNetwork = true;
+              RestrictAddressFamilies = [ "AF_UNIX" ];
+            };
+          };
+          agent-research-ledger-witness = lib.mkIf cfg.guardedLedger.enable {
+            description = "Fixed-target host Research ledger witness";
+            requires = [ "agent-research-ledger-witness.socket" ];
+            after = [ "agent-research-ledger-witness.socket" ];
+            bindsTo = [ "agent-research-ledger-witness.socket" ];
+            # No mount namespace: a private root, bind mount, ProtectSystem or
+            # PrivateTmp could pin an old host mount and hide replacement.
+            # Restrict AF_UNIX instead of creating a private network namespace.
+            serviceConfig = {
+              Type = "simple";
+              User = "agent-research-ledger-witness";
+              Group = "agent-research-ledger-witness";
+              ExecStart = "${cfg.package}/bin/research-service --ledger-witness --listen-fd 3 --ledger-marker ${cfg.guardedLedger.markerPath} --witness-state-directory /var/lib/agent-research --witness-service-uid ${toString serviceUid} --witness-process-uid ${toString witnessUid} --witness-socket ${ledgerWitnessSocket}";
+              Sockets = [ "agent-research-ledger-witness.socket" ];
+              Restart = "no";
+              NoNewPrivileges = true;
+              CapabilityBoundingSet = "";
+              RestrictNamespaces = true;
+              RestrictAddressFamilies = [ "AF_UNIX" ];
+              SystemCallFilter = [ "~@mount @swap @reboot @raw-io @module @debug" ];
+              SystemCallErrorNumber = "EPERM";
+              MemoryDenyWriteExecute = true;
+              LockPersonality = true;
+              RestrictRealtime = true;
+              RestrictSUIDSGID = true;
+              DevicePolicy = "closed";
+              TasksMax = 32;
+              MemoryMax = "128M";
+            };
+          };
           agent-research = {
             requires = [
               "agent-research-egress.socket"
               "agent-research-egress-control.service"
             ]
-            ++ lib.optional cfg.searxng.enable "agent-research-searxng.socket";
+            ++ lib.optional cfg.searxng.enable "agent-research-searxng.socket"
+            ++ lib.optionals cfg.guardedLedger.enable [
+              "agent-research-ledger-check.service"
+              "agent-research-ledger-witness.socket"
+              "agent-research-ledger-witness.service"
+            ];
             after = [
               "agent-research-egress.socket"
               "agent-research-egress-control.service"
             ]
-            ++ lib.optional cfg.searxng.enable "agent-research-searxng.socket";
+            ++ lib.optional cfg.searxng.enable "agent-research-searxng.socket"
+            ++ lib.optionals cfg.guardedLedger.enable [
+              "agent-research-ledger-check.service"
+              "agent-research-ledger-witness.socket"
+              "agent-research-ledger-witness.service"
+            ];
+            bindsTo = lib.optional cfg.guardedLedger.enable "agent-research-ledger-witness.service";
             serviceConfig = common // {
               User = "agent-research";
               Group = "agent-research";
@@ -735,7 +897,9 @@ in
                   "/run/agent-research"
                   "/run/agent-research-egress"
                 ]
-                ++ lib.optional cfg.searxng.enable "/run/agent-research-searxng";
+                ++ lib.optional cfg.searxng.enable "/run/agent-research-searxng"
+                ++ lib.optional cfg.guardedLedger.enable ledgerMarkerDirectory
+                ++ lib.optional cfg.guardedLedger.enable ledgerWitnessSocket;
               StateDirectory = "agent-research";
               StateDirectoryMode = "0700";
               PrivateNetwork = true;

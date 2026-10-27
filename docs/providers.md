@@ -1,9 +1,9 @@
 # Provider grants, data and billing
 
-The implemented search providers are Brave Web Search, Tavily and a self-hosted
-SearXNG instance. Firecrawl and Spider are implemented for explicit scrape,
-sharing the same `ScrapeProvider` trait. An OpenAI-compatible adapter implements the separately
-enabled summarization expansion. A key never activates a capability.
+The implemented search providers are Brave Web Search, Tavily, Spider and a
+self-hosted SearXNG instance. Firecrawl and Spider also implement explicit scrape.
+An OpenAI-compatible adapter implements separately enabled summarization.
+A key never activates a capability.
 Operator configuration must explicitly enable each provider, grant `search` and
 `queries` (search), `scrape`, `urls` and `content` (scrape), or `summarize` and
 `content` plus a `model` (summarize), name its systemd credential, configure a
@@ -11,9 +11,10 @@ successful-request price and choose whether persistent storage rights are
 available. Self-hosted SearXNG is the exception: it needs no credential and no
 price, and instead names a bare public HTTPS `endpoint`. Search only uses
 providers listed in `search_order`, scrape only `scrape_order` and
-summarization only `summarize_order`; the orders are pairwise disjoint. No
-environment-variable key discovery or personal model login is involved, and no
-retrieval operation depends on an LLM.
+summarization only `summarize_order`. Spider may occur in both search and scrape
+orders; each capability and its data grants remain independent, and ranking alone
+grants neither. No environment-variable key discovery or personal model login is
+involved, and no retrieval operation depends on an LLM.
 
 No commercial adapter is selected by default: `search_order`, `scrape_order` and
 `summarize_order` are empty. The NixOS module selects `searxng` only when its local
@@ -113,6 +114,37 @@ policy before use, and a private or malformed URL falls back to the requested
 target. Robots is checked through the same selected-page decision as a local
 fetch before any provider call, so an explicit provider request still cannot
 bypass an access block.
+
+## Spider (search)
+
+Spider search uses the fixed `POST https://api.spider.cloud/search` endpoint
+with the named credential in a sensitive bearer header. The validated query
+becomes `search`; `num` and `search_limit` are the requested count.
+`fetch_page_content`, `auto_pagination`, `cache`, `session`, `proxy_enabled`,
+`fingerprint`, `anti_bot` and `stealth` are false; `quick_search` is true and
+`request` is `"http"`. An optional uppercase two-letter country is sent lowercase.
+The only currently accepted explicit language is `en`, the two-letter example in
+the public guide. Other languages and locale forms are rejected before I/O until
+their provider support is established; omission remains allowed. The provider's
+complete supported language and country code lists have not been established.
+Freshness maps day, week, month and year to `tbs: "qdr:d"`, `"qdr:w"`, `"qdr:m"` and `"qdr:y"`.
+[Search contract](https://spider.cloud/docs/api/search) and
+[realtime search](https://spider.cloud/docs/core/realtime-search).
+
+Search accepts the documented `{"content":[...]}` envelope, a top-level array or
+`{"results":[...]}`. Each valid hit uses `title`, `url` and `description`;
+malformed and non-public URLs are omitted, fragment-free URLs deduplicated, and
+the result count bounded. Exact JSON is archived as `spider-http-json/v1`,
+separate from derived `spider-web-search/v1` results. Both are untrusted data;
+search results alone are not evidence that a page was fetched.
+
+The same strictly positive operator-configured `request_micro_usd` ceiling
+applies to either Spider search or scrape. Success settles the full ceiling;
+uncertain errors and cancellation retain the hold, with no automatic retry or
+cross-provider fallback. The ceiling is not a verified provider tariff or
+guaranteed invoice bound: current provider costs or hard caps must be established
+separately before paid use. Read job-scoped ephemeral evidence before finishing
+or canceling the job.
 
 ## Spider (scrape)
 

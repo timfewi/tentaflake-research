@@ -20,6 +20,7 @@ let
       uid = 4100;
       isNormalUser = true;
     };
+    users.groups.fixture-witness-collision.gid = 4101;
   };
   evaluate =
     extra:
@@ -88,7 +89,30 @@ let
       result = builtins.tryEval (builtins.all (item: item.assertion) (evaluate overrides).assertions);
     in
     !result.success || !result.value;
+  markerRejected =
+    overrides:
+    builtins.any (
+      item:
+      !item.assertion
+      &&
+        item.message
+        == "The guarded ledger marker must use a normalized, separate persistent directory under /var/lib."
+    ) (evaluate overrides).assertions;
+  witnessIdentityRejected =
+    overrides:
+    builtins.any (
+      item:
+      !item.assertion
+      && item.message == "Guarded Research requires an explicit dedicated non-root witness UID/GID."
+    ) (evaluate overrides).assertions;
   service = valid.systemd.services.agent-research.serviceConfig;
+  guarded = evaluate {
+    guardedLedger = {
+      enable = true;
+      witnessUid = 4203;
+    };
+  };
+  guardedService = guarded.systemd.services.agent-research.serviceConfig;
   egress = valid.systemd.services.agent-research-egress.serviceConfig;
   control = valid.systemd.services.agent-research-egress-control.serviceConfig;
   journal = valid.environment.etc."systemd/journald@secure-research.conf".text;
@@ -102,6 +126,25 @@ let
       requestMicroUsd = 5000;
     };
     browser.enable = true;
+  };
+  spiderProvider = {
+    enable = true;
+    capabilities = [
+      "search"
+      "scrape"
+    ];
+    data = [
+      "queries"
+      "urls"
+      "content"
+    ];
+    apiKeyFile = "/run/secrets/research-fixture-spider";
+    requestMicroUsd = 125000;
+  };
+  spiderConfig = {
+    searchOrder = [ "spider" ];
+    scrapeOrder = [ "spider" ];
+    providers.spider = spiderProvider;
   };
   openaiProvider = {
     enable = true;
@@ -137,6 +180,25 @@ let
         "agent-research.socket"
         "agent-research-searxng.service"
         "agent-research-searxng.socket"
+        "agent-research-egress.service"
+        "agent-research-egress.socket"
+        "agent-research-egress-control.service"
+        "agent-research.slice"
+        "nftables.service"
+      ]
+  );
+  guardedUnitFiles = pkgs.linkFarm "research-guarded-test-units" (
+    map
+      (name: {
+        inherit name;
+        path = pkgs.writeText name guarded.systemd.units.${name}.text;
+      })
+      [
+        "agent-research.service"
+        "agent-research-ledger-check.service"
+        "agent-research-ledger-witness.service"
+        "agent-research-ledger-witness.socket"
+        "agent-research.socket"
         "agent-research-egress.service"
         "agent-research-egress.socket"
         "agent-research-egress-control.service"
@@ -366,6 +428,167 @@ let
       expr = builtins.all (item: item.assertion) valid.assertions;
       expected = true;
     };
+    testGuardedLedgerBlockedAndReadOnlyProjection = {
+      expr =
+        (builtins.any (
+          item:
+          !item.assertion
+          &&
+            item.message
+            == "Guarded Research admission is blocked pending continuous host witness review and verification."
+        ) guarded.assertions)
+        && builtins.elem "/var/lib/agent-research-guard" guardedService.BindReadOnlyPaths
+        && !(builtins.elem "/var/lib/agent-research-guard" (guardedService.BindPaths or [ ]));
+      expected = true;
+    };
+    testGuardedLedgerHostPrestartCheck = {
+      expr =
+        let
+          check = guarded.systemd.services.agent-research-ledger-check.serviceConfig;
+        in
+        check.User == "root"
+        && !(check ? RootDirectory)
+        && lib.hasInfix "--check-ledger-guard --ledger-marker /var/lib/agent-research-guard/budget.marker" check.ExecStart
+        && builtins.elem "agent-research-ledger-check.service" guarded.systemd.services.agent-research.requires
+        && builtins.elem "agent-research-ledger-check.service" guarded.systemd.services.agent-research.after;
+      expected = true;
+    };
+    testGuardedLedgerWitnessIsFixedAndSandboxed = {
+      expr =
+        let
+          unit = guarded.systemd.services.agent-research-ledger-witness.serviceConfig;
+          socketUnit = guarded.systemd.sockets.agent-research-ledger-witness;
+        in
+        unit.User == "agent-research-ledger-witness"
+        && unit.Group == "agent-research-ledger-witness"
+        && guarded.users.users.agent-research-ledger-witness.uid == 4203
+        && guarded.users.groups.agent-research-ledger-witness.gid == 4203
+        && !(unit.PrivateNetwork or false)
+        && !(unit ? RootDirectory)
+        && !(unit ? BindReadOnlyPaths)
+        && !(unit ? ProtectSystem)
+        && !(unit.PrivateTmp or false)
+        && unit.NoNewPrivileges
+        && unit.RestrictNamespaces
+        && unit.RestrictAddressFamilies == [ "AF_UNIX" ]
+        && unit.CapabilityBoundingSet == ""
+        && unit.Restart == "no"
+        && lib.hasInfix "--ledger-marker /var/lib/agent-research-guard/budget.marker --witness-state-directory /var/lib/agent-research --witness-service-uid 4201 --witness-process-uid 4203" unit.ExecStart
+        && socketUnit.listenStreams == [ "/run/agent-research-ledger-witness/socket" ]
+        && socketUnit.socketConfig.SocketUser == "root"
+        && socketUnit.socketConfig.SocketGroup == "agent-research"
+        && socketUnit.socketConfig.SocketMode == "0660"
+        && builtins.elem "/run/agent-research-ledger-witness/socket" guardedService.BindReadOnlyPaths
+        && !(builtins.elem "/run/agent-research-ledger-witness" guardedService.BindReadOnlyPaths)
+        && builtins.elem "agent-research-ledger-witness.service" guarded.systemd.services.agent-research.bindsTo
+        && builtins.elem "agent-research-ledger-witness.socket" guarded.systemd.services.agent-research-ledger-witness.bindsTo;
+      expected = true;
+    };
+    testGuardedWitnessSocketIsPassedToService = {
+      expr =
+        (builtins.fromJSON (builtins.readFile (configurationPath guardedService)))
+        .ledger_guard_witness_socket;
+      expected = "/run/agent-research-ledger-witness/socket";
+    };
+    testGuardedWitnessRequiresExplicitDistinctUid = {
+      expr =
+        witnessIdentityRejected { guardedLedger.enable = true; }
+        && witnessIdentityRejected {
+          guardedLedger = {
+            enable = true;
+            witnessUid = 4201;
+          };
+        }
+        && witnessIdentityRejected {
+          guardedLedger = {
+            enable = true;
+            witnessUid = 4202;
+          };
+        }
+        && witnessIdentityRejected {
+          guardedLedger = {
+            enable = true;
+            witnessUid = 4100;
+          };
+        };
+      expected = true;
+    };
+    testGuardedWitnessRejectsConfiguredUserAndGroupCollisions = {
+      expr =
+        builtins.any
+          (
+            item:
+            !item.assertion && item.message == "Research service UID collides with another configured user."
+          )
+          (evaluate {
+            guardedLedger = {
+              enable = true;
+              witnessUid = 4100;
+            };
+          }).assertions
+        &&
+          builtins.any
+            (
+              item:
+              !item.assertion && item.message == "Research service GID collides with another configured group."
+            )
+            (evaluate {
+              guardedLedger = {
+                enable = true;
+                witnessUid = 4101;
+              };
+            }).assertions;
+      expected = true;
+    };
+    testGuardedLedgerIsOptIn = {
+      expr =
+        !valid.services.secureResearch.guardedLedger.enable
+        && !(builtins.elem "/var/lib/agent-research-guard" service.BindReadOnlyPaths);
+      expected = true;
+    };
+    testGuardedLedgerIsPassedToService = {
+      expr =
+        (builtins.fromJSON (builtins.readFile (configurationPath guardedService))).ledger_guard_marker;
+      expected = "/var/lib/agent-research-guard/budget.marker";
+    };
+    testDefaultLedgerIsUnguardedInService = {
+      expr = (builtins.fromJSON (builtins.readFile (configurationPath service))).ledger_guard_marker;
+      expected = null;
+    };
+    testGuardedLedgerMarkerOutsideState = {
+      expr = markerRejected {
+        guardedLedger = {
+          enable = true;
+          markerPath = "/var/lib/agent-research/budget.marker";
+        };
+      };
+      expected = true;
+    };
+    testGuardedLedgerMarkerMustBePersistentAndNormalized = {
+      expr =
+        markerRejected {
+          guardedLedger = {
+            enable = true;
+            markerPath = "/run/agent-research-guard/budget.marker";
+          };
+        }
+        && markerRejected {
+          guardedLedger = {
+            enable = true;
+            markerPath = "/var/lib/agent-research-guard/../budget.marker";
+          };
+        };
+      expected = true;
+    };
+    testGuardedMarkerCannotReplaceLock = {
+      expr = markerRejected {
+        guardedLedger = {
+          enable = true;
+          markerPath = "/var/lib/agent-research-guard/ledger.lock";
+        };
+      };
+      expected = true;
+    };
     testMissingIdentity = {
       expr = rejected { serviceUid = null; };
       expected = true;
@@ -430,6 +653,115 @@ let
     testStoreCredential = {
       expr = rejected { providers.brave.apiKeyFile = "/nix/store/fixture-secret"; };
       expected = true;
+    };
+    testSpiderDualGrant = {
+      expr = rejected spiderConfig;
+      expected = false;
+    };
+    testSpiderSearchOnly = {
+      expr = rejected (
+        spiderConfig
+        // {
+          providers.spider = spiderProvider // {
+            capabilities = [ "search" ];
+            data = [ "queries" ];
+          };
+        }
+      );
+      expected = false;
+    };
+    testSpiderScrapeOnly = {
+      expr = rejected (
+        spiderConfig
+        // {
+          providers.spider = spiderProvider // {
+            capabilities = [ "scrape" ];
+            data = [
+              "urls"
+              "content"
+            ];
+          };
+        }
+      );
+      expected = false;
+    };
+    testSpiderMissingQueries = {
+      expr = rejected (
+        spiderConfig
+        // {
+          providers.spider = spiderProvider // {
+            data = [
+              "urls"
+              "content"
+            ];
+          };
+        }
+      );
+      expected = true;
+    };
+    testSpiderMissingUrls = {
+      expr = rejected (
+        spiderConfig
+        // {
+          providers.spider = spiderProvider // {
+            data = [
+              "queries"
+              "content"
+            ];
+          };
+        }
+      );
+      expected = true;
+    };
+    testSpiderMissingContent = {
+      expr = rejected (
+        spiderConfig
+        // {
+          providers.spider = spiderProvider // {
+            data = [
+              "queries"
+              "urls"
+            ];
+          };
+        }
+      );
+      expected = true;
+    };
+    testSpiderZeroPrice = {
+      expr = rejected (
+        spiderConfig
+        // {
+          providers.spider = spiderProvider // {
+            requestMicroUsd = 0;
+          };
+        }
+      );
+      expected = true;
+    };
+    testDisabledSpiderZeroPriceUnchanged = {
+      expr = rejected (
+        spiderConfig
+        // {
+          providers.spider = spiderProvider // {
+            enable = false;
+            requestMicroUsd = 0;
+          };
+        }
+      );
+      expected = false;
+    };
+    testBraveZeroPriceUnchanged = {
+      expr = rejected {
+        searchOrder = [ "brave" ];
+        providers.brave = {
+          enable = true;
+          capabilities = [ "search" ];
+          data = [ "queries" ];
+          apiKeyFile = "/run/secrets/research-fixture-brave";
+          requestMicroUsd = 0;
+        };
+      };
+      expected = false;
     };
     testSummarizeValid = {
       expr = builtins.all (item: item.assertion) summarized.assertions;
@@ -545,6 +877,7 @@ pkgs.runCommand "research-module-evaluation"
     nativeBuildInputs = [ pkgs.systemd ];
     inherit unitFiles;
     inherit localUnitFiles;
+    inherit guardedUnitFiles;
     serviceConfiguration = configurationPath service;
     browserConfiguration = configurationPath browserService;
     summaryConfiguration = configurationPath summaryService;
@@ -567,6 +900,10 @@ pkgs.runCommand "research-module-evaluation"
       systemd-analyze verify --user --man=no \
         "$localUnitFiles/agent-research.service" \
         "$localUnitFiles/agent-research-searxng.service" "$localUnitFiles/agent-research-searxng.socket"
+    SYSTEMD_UNIT_PATH="$guardedUnitFiles:${pkgs.systemd}/example/systemd/system" \
+      systemd-analyze verify --user --man=no \
+        "$guardedUnitFiles/agent-research.service" "$guardedUnitFiles/agent-research-ledger-check.service" \
+        "$guardedUnitFiles/agent-research-ledger-witness.socket" "$guardedUnitFiles/agent-research-ledger-witness.service"
     mkdir -p "$out"
     cp "$serviceConfiguration" "$out/service.json"
     cp "$browserConfiguration" "$out/browser.json"

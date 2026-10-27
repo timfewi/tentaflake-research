@@ -2323,6 +2323,7 @@ async fn malformed_first_provider_falls_back_and_links_its_raw_evidence() {
     assert_eq!(result["coverage"]["success"], 1, "{result}");
     assert_eq!(result["items"][0]["data"]["provider"], "spider");
     assert_eq!(fixture.upstream.posts.load(Ordering::SeqCst), 2);
+    assert_eq!(result["usage"]["documents"], 1);
     let attempts = result["items"][0]["data"]["provider_attempts"]
         .as_array()
         .unwrap();
@@ -2426,6 +2427,8 @@ async fn billed_spider_throttle_does_not_trigger_cross_provider_fallback() {
     .await;
     assert_eq!(result["items"][0]["error"], "rate_limited", "{result}");
     assert_eq!(fixture.upstream.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(result["usage"]["documents"], 1);
+    assert_eq!(result["usage"]["held_micro_usd"], 5000);
 }
 
 #[tokio::test]
@@ -2554,6 +2557,395 @@ async fn spider_provider_fetch_archives_the_array_envelope_and_markdown() {
     )
     .await;
     assert_eq!(text["content"], "Exact é 👩‍🔬 quote.");
+}
+
+const SPIDER_SEARCH_FIXTURE: &str = r#"{"content":[{"title":"Battery recycling","url":"https://example.com/recycling#intro","description":"Untrusted fixture"}]}"#;
+
+struct PilotUpstream {
+    ledger: Arc<Ledger>,
+    posts: AtomicUsize,
+    gets: AtomicUsize,
+    status: u16,
+    suspend: bool,
+    started: Notify,
+}
+
+#[async_trait::async_trait]
+impl Transport for PilotUpstream {
+    async fn get(
+        &self,
+        owner: u32,
+        job: Uuid,
+        request: HttpRequest,
+        _: &CancellationToken,
+    ) -> Result<HttpResponse> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(request.target.url().path(), "/robots.txt");
+        let body = b"User-agent: *\nAllow: /\n".to_vec();
+        let charge = self.ledger.reserve_up_to_bytes(
+            owner,
+            job,
+            Charge {
+                bytes: request.max_bytes + 1,
+                requests: 1,
+                ..Charge::default()
+            },
+            2,
+        )?;
+        charge.finish(body.len() as u64, Some(0))?;
+        Ok(HttpResponse {
+            status: 200,
+            headers: HeaderMap::new(),
+            body,
+        })
+    }
+
+    async fn post(
+        &self,
+        owner: u32,
+        job: Uuid,
+        request: HttpRequest,
+        body: Vec<u8>,
+        stop: &CancellationToken,
+    ) -> Result<HttpResponse> {
+        let outgoing = body.len() as u64;
+        let charge = self.ledger.reserve_up_to_bytes(
+            owner,
+            job,
+            Charge {
+                bytes: request.max_bytes + 1 + outgoing,
+                micro_usd: request.micro_usd,
+                requests: 1,
+                queries: u32::from(request.query),
+                ..Charge::default()
+            },
+            outgoing + 2,
+        )?;
+        self.posts.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(request.target.origin(), "https://api.spider.cloud");
+        assert_eq!(request.headers["authorization"], "Bearer fixture-key");
+        assert!(request.headers["authorization"].is_sensitive());
+        assert!(!String::from_utf8_lossy(&body).contains("fixture-key"));
+        assert!(!request.errors_are_unbilled);
+        let response = match request.target.url().path() {
+            "/search" => {
+                assert!(request.query);
+                SPIDER_SEARCH_FIXTURE
+            }
+            "/scrape" => {
+                assert!(!request.query);
+                SPIDER_FIXTURE
+            }
+            _ => panic!("unexpected endpoint"),
+        };
+        if self.suspend {
+            self.started.notify_one();
+            stop.cancelled().await;
+            return Err(ErrorCode::Cancelled);
+        }
+        let cost = if (200..300).contains(&self.status) {
+            Some(request.micro_usd)
+        } else {
+            None
+        };
+        charge.finish(outgoing + response.len() as u64, cost)?;
+        Ok(HttpResponse {
+            status: self.status,
+            headers: HeaderMap::new(),
+            body: response.as_bytes().to_vec(),
+        })
+    }
+}
+
+struct PilotFixture {
+    _root: tempfile::TempDir,
+    service: Arc<Service>,
+    upstream: Arc<PilotUpstream>,
+    ledger: Arc<Ledger>,
+    owner: u32,
+}
+
+async fn pilot_fixture(price: u64, status: u16, suspend: bool, fallback: bool) -> PilotFixture {
+    let root = tempfile::tempdir().unwrap();
+    let owner = rustix::process::getuid().as_raw();
+    let spider = ProviderConfig {
+        enable: true,
+        capabilities: [Capability::Search, Capability::Scrape].into(),
+        data: [DataClass::Queries, DataClass::Urls, DataClass::Content].into(),
+        credential: Some("spider".into()),
+        request_micro_usd: Some(price),
+        storage_rights: false,
+        ..ProviderConfig::default()
+    };
+    let mut config = Config {
+        state_directory: root.path().join("state"),
+        allowed_client_uids: vec![owner],
+        egress_uid: Some(1002),
+        privacy: Privacy::Practical,
+        providers: [("spider".into(), spider.clone())].into(),
+        search_order: vec!["spider".into()],
+        scrape_order: vec!["spider".into()],
+        summarize_order: vec![],
+        limits: Limits {
+            daily_micro_usd: 1_000_000,
+            job_micro_usd: 250_000,
+            job_seconds: 300,
+            queries: 4,
+            documents: 10,
+            requests: 20,
+            job_bytes: 16 * 1024 * 1024,
+            pdf_bytes: 16 * 1024 * 1024,
+            active_jobs: 1,
+            ..Limits::default()
+        },
+        ..Config::default()
+    };
+    config.robots.selected_page_error_allows = false;
+    let mut search: Vec<Arc<dyn SearchProvider>> =
+        vec![Arc::new(Spider::new(&spider, b"fixture-key").unwrap())];
+    if fallback {
+        let brave = ProviderConfig {
+            enable: true,
+            capabilities: [Capability::Search].into(),
+            data: [DataClass::Queries].into(),
+            credential: Some("brave".into()),
+            request_micro_usd: Some(5000),
+            ..ProviderConfig::default()
+        };
+        config.providers.insert("brave".into(), brave.clone());
+        config.search_order.push("brave".into());
+        search.push(Arc::new(Brave::new(&brave, b"fixture-key").unwrap()));
+    }
+    config.validate().unwrap();
+    std::fs::create_dir_all(&config.state_directory).unwrap();
+    let ledger = Ledger::open(
+        &config.state_directory.join("budget.sqlite"),
+        config.limits.clone(),
+    )
+    .unwrap();
+    let store = EvidenceStore::open(&config, root.path().to_owned()).unwrap();
+    let upstream = Arc::new(PilotUpstream {
+        ledger: ledger.clone(),
+        posts: AtomicUsize::new(0),
+        gets: AtomicUsize::new(0),
+        status,
+        suspend,
+        started: Notify::new(),
+    });
+    let service = Service::new(
+        config,
+        Dependencies {
+            ledger: ledger.clone(),
+            store,
+            http: upstream.clone(),
+            parser: None,
+            search_providers: search,
+            scrape_providers: vec![Arc::new(Spider::new(&spider, b"fixture-key").unwrap())],
+            summarize_providers: vec![],
+        },
+    )
+    .unwrap();
+    service.update_egress(ready()).await.unwrap();
+    PilotFixture {
+        _root: root,
+        service,
+        upstream,
+        ledger,
+        owner,
+    }
+}
+
+async fn pilot_call(fixture: &PilotFixture, tool: Tool, args: Value) -> Value {
+    fixture
+        .service
+        .call(
+            fixture.owner,
+            Uuid::new_v4(),
+            tool,
+            args,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn pilot_job(fixture: &PilotFixture, limits: Value) -> Uuid {
+    let started = pilot_call(
+        fixture,
+        Tool::ResearchJob,
+        json!({"operation":"start","limits":limits}),
+    )
+    .await;
+    serde_json::from_value(started["job"]["id"].clone()).unwrap()
+}
+
+#[tokio::test]
+async fn spider_pilot_search_fetch_archives_distinct_evidence_and_reserves_both_ceilings() {
+    let fixture = pilot_fixture(125_000, 200, false, false).await;
+    let id = pilot_job(&fixture, json!({})).await;
+    let search = pilot_call(
+        &fixture,
+        Tool::ResearchSearch,
+        json!({"job_id":id,"queries":[{"q":"battery recycling","count":1}]}),
+    )
+    .await;
+    let result = &search["items"][0]["data"]["result"];
+    assert_eq!(result["untrusted"], true);
+    assert_eq!(
+        result["results"]["hits"][0]["url"],
+        "https://example.com/recycling"
+    );
+    assert_eq!(result["results"]["hits"][0]["untrusted"], true);
+    assert_eq!(search["usage"]["known_micro_usd"], 125_000);
+    let source = &result["source"]["id"];
+    let metadata = pilot_call(
+        &fixture,
+        Tool::ResearchRead,
+        json!({"kind":"metadata","source_id":source}),
+    )
+    .await;
+    let reps = metadata["representations"].as_array().unwrap();
+    assert_eq!(reps.len(), 2);
+    assert_eq!(reps[0]["kind"], "http_entity");
+    assert_eq!(reps[1]["kind"], "search_results");
+    assert_eq!(reps[1]["derived_from"], reps[0]["id"]);
+    let raw = pilot_call(
+        &fixture,
+        Tool::ResearchRead,
+        json!({"kind":"source","source_id":source,"representation_id":reps[0]["id"]}),
+    )
+    .await;
+    let normalized = pilot_call(
+        &fixture,
+        Tool::ResearchRead,
+        json!({"kind":"source","source_id":source,"representation_id":reps[1]["id"]}),
+    )
+    .await;
+    assert_eq!(raw["content"], SPIDER_SEARCH_FIXTURE);
+    assert_ne!(raw["content"], normalized["content"]);
+    assert!(!raw.to_string().contains("fixture-key"));
+    assert!(!normalized.to_string().contains("fixture-key"));
+    let fetched = pilot_call(
+        &fixture,
+        Tool::ResearchFetch,
+        json!({"job_id":id,"mode":"provider","urls":["https://example.com/one"]}),
+    )
+    .await;
+    assert_eq!(fetched["coverage"]["success"], 1, "{fetched}");
+    assert_eq!(fetched["usage"]["documents"], 1);
+    assert_eq!(fetched["usage"]["queries"], 1);
+    assert_eq!(fetched["usage"]["known_micro_usd"], 250_000);
+    assert_eq!(fixture.upstream.posts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn spider_zero_document_limit_precedes_robots_and_provider() {
+    let fixture = pilot_fixture(125_000, 200, false, false).await;
+    let id = pilot_job(&fixture, json!({"documents":0})).await;
+    let fetched = pilot_call(
+        &fixture,
+        Tool::ResearchFetch,
+        json!({"job_id":id,"mode":"provider","urls":["https://example.com/one"]}),
+    )
+    .await;
+    assert_eq!(fetched["items"][0]["error"], "budget_exceeded", "{fetched}");
+    assert_eq!(fetched["usage"]["documents"], 0);
+    assert_eq!(fixture.upstream.posts.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.upstream.gets.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn spider_document_budget_is_consumed_once_per_selected_item() {
+    let fixture = pilot_fixture(125_000, 200, false, false).await;
+    let id = pilot_job(&fixture, json!({"documents":1})).await;
+    let first = pilot_call(
+        &fixture,
+        Tool::ResearchFetch,
+        json!({"job_id":id,"mode":"provider","urls":["https://example.com/one"]}),
+    )
+    .await;
+    assert_eq!(first["coverage"]["success"], 1, "{first}");
+    assert_eq!(first["usage"]["documents"], 1);
+    let robots_calls = fixture.upstream.gets.load(Ordering::SeqCst);
+    let second = pilot_call(
+        &fixture,
+        Tool::ResearchFetch,
+        json!({"job_id":id,"mode":"provider","urls":["https://example.org/two"]}),
+    )
+    .await;
+    assert_eq!(second["items"][0]["error"], "budget_exceeded", "{second}");
+    assert_eq!(second["usage"]["documents"], 1);
+    assert_eq!(fixture.upstream.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.upstream.gets.load(Ordering::SeqCst), robots_calls);
+}
+
+#[tokio::test]
+async fn spider_generic_budget_cannot_afford_two_requests_at_125001() {
+    let fixture = pilot_fixture(125_001, 200, false, false).await;
+    let id = pilot_job(&fixture, json!({})).await;
+    let search = pilot_call(
+        &fixture,
+        Tool::ResearchSearch,
+        json!({"job_id":id,"queries":[{"q":"battery recycling","count":1}]}),
+    )
+    .await;
+    assert_eq!(search["usage"]["known_micro_usd"], 125_001);
+    let fetched = pilot_call(
+        &fixture,
+        Tool::ResearchFetch,
+        json!({"job_id":id,"mode":"provider","urls":["https://example.com/one"]}),
+    )
+    .await;
+    assert_eq!(fetched["items"][0]["error"], "budget_exceeded", "{fetched}");
+    assert_eq!(fixture.upstream.posts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn spider_search_throttle_retains_hold_without_retry_or_fallback() {
+    let fixture = pilot_fixture(125_000, 429, false, true).await;
+    let id = pilot_job(&fixture, json!({})).await;
+    let search = pilot_call(
+        &fixture,
+        Tool::ResearchSearch,
+        json!({"job_id":id,"queries":[{"q":"battery recycling","count":1}]}),
+    )
+    .await;
+    assert_eq!(search["items"][0]["error"], "rate_limited", "{search}");
+    assert_eq!(search["usage"]["held_micro_usd"], 125_000);
+    assert_eq!(search["usage"]["known_micro_usd"], 0);
+    assert_eq!(fixture.upstream.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.upstream.gets.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn spider_search_cancellation_retains_hold_without_retry_or_fallback() {
+    let fixture = pilot_fixture(125_000, 200, true, true).await;
+    let id = pilot_job(&fixture, json!({})).await;
+    let stop = CancellationToken::new();
+    let service = fixture.service.clone();
+    let owner = fixture.owner;
+    let cancellation = stop.clone();
+    let pending = tokio::spawn(async move {
+        service
+            .call(
+                owner,
+                Uuid::new_v4(),
+                Tool::ResearchSearch,
+                json!({"job_id":id,"queries":[{"q":"battery recycling","count":1}]}),
+                cancellation,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), fixture.upstream.started.notified())
+        .await
+        .unwrap();
+    stop.cancel();
+    assert!(matches!(pending.await.unwrap(), Err(ErrorCode::Cancelled)));
+    let usage = fixture.ledger.get(fixture.owner, id).unwrap().usage;
+    assert_eq!(usage.held_micro_usd, 125_000);
+    assert_eq!(usage.known_micro_usd, 0);
+    assert_eq!(fixture.upstream.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.upstream.gets.load(Ordering::SeqCst), 0);
 }
 
 // ---------------------------------------------------------------------------
