@@ -74,7 +74,6 @@ remain provider-independent; the normal client graph has no Chromium, HTTP/TLS,
 DNS, HTML extraction or SQLite libraries. Client package sources exclude
 service/provider implementation files, so changes confined to those files do
 not invalidate the client package. Fetching sources still uses the shared lockfile.
-Use `path:.` when evaluating a working tree containing new, unstaged Nix files.
 
 ```sh
 nix build --no-link .#research-service .#research-client .#research-egress

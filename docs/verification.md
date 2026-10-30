@@ -6,9 +6,9 @@ upstreams and credentials in these fixtures are synthetic.
 
 | Boundary | Check | Latest recorded evidence |
 | --- | --- | --- |
-| Rust policy, budgets, ownership, protocols | `project-check fast` | Passed on client-recovery source, 2026-10-01 |
-| Pinned packaged service/client/egress | `project-check full` | Passed on client-recovery source, 2026-10-01 |
-| NixOS options, nftables syntax, aggregate resources | `module`, `network-boundary`, `resource-boundary` | Passed on client-recovery source, 2026-10-01 |
+| Rust policy, budgets, ownership, protocols | `project-check fast` | Passed on native-environment base `6c3e058` with the test-only JSON-context fix, 2026-10-30 |
+| Pinned packaged service/client/egress | `project-check full` | Passed on the same checkpoint, 2026-10-30 |
+| NixOS options, nftables syntax, aggregate resources | `module`, `network-boundary`, `resource-boundary` | Passed within the same full gate, 2026-10-30 |
 | Real deployed service and stdio MCP | `credentials-vm`, `resources-vm` | Extraction baseline passed with real stdio MCP, 2026-10-01 |
 | Firewall direct-path denial | `network-boundary-wireguard-vm` | Extraction baseline passed, including direct physical path denial, 2026-10-01 |
 | Real encrypted VPN and tunnel loss | `network-boundary-wireguard-vm` | Extraction baseline passed, 2026-10-01 |
@@ -22,6 +22,16 @@ Live paid-provider billing, a production operator's VPN/firewall, arbitrary kern
 or nested-mount escapes and ARM compatibility have not been accepted. The synthetic
 tests do not require real API keys. No production host has been activated by this
 extraction.
+
+The 2026-10-30 checkpoint preserves production Rust, module configuration and the
+Cargo lockfile. Nix 2.35.3 first reproduced a context-bearing fixture JSON decode
+failure. The test-only decoder now clears context from assertion data, while
+the original configuration paths remain derivation inputs; a new assertion checks
+their dependency contexts. All ledger expectations and boundary gates remain in
+place. The fast gate includes the standalone-client dependency guard, Clippy with
+warnings denied, 320 default-feature library tests and 71 service RPC tests.
+These synthetic checks and package builds do not refresh any historical VM,
+production VPN, paid-provider or real-agent evidence below.
 
 The extraction baseline (`6536617`) passed 269 Rust tests plus formatting,
 Clippy, Nix lints and ShellCheck. Its three package outputs and configuration

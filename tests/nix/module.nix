@@ -213,6 +213,12 @@ let
         builtins.filter (value: lib.hasSuffix ":/etc/research/config.json" value) unit.BindReadOnlyPaths
       )
     );
+  # Decode fixture values only; the derivation below retains the contextual paths.
+  configurationValues =
+    unit:
+    builtins.fromJSON (
+      builtins.unsafeDiscardStringContext (builtins.readFile (configurationPath unit))
+    );
   browserService = granted.systemd.services.agent-research.serviceConfig;
   unitFiles = pkgs.linkFarm "research-module-test-units" (
     map
@@ -485,9 +491,7 @@ let
       expected = true;
     };
     testGuardedWitnessSocketIsPassedToService = {
-      expr =
-        (builtins.fromJSON (builtins.readFile (configurationPath guardedService)))
-        .ledger_guard_witness_socket;
+      expr = (configurationValues guardedService).ledger_guard_witness_socket;
       expected = "/run/agent-research-ledger-witness/socket";
     };
     testGuardedWitnessRequiresExplicitDistinctUid = {
@@ -547,13 +551,19 @@ let
       expected = true;
     };
     testGuardedLedgerIsPassedToService = {
-      expr =
-        (builtins.fromJSON (builtins.readFile (configurationPath guardedService))).ledger_guard_marker;
+      expr = (configurationValues guardedService).ledger_guard_marker;
       expected = "/var/lib/agent-research-guard/budget.marker";
     };
     testDefaultLedgerIsUnguardedInService = {
-      expr = (builtins.fromJSON (builtins.readFile (configurationPath service))).ledger_guard_marker;
+      expr = (configurationValues service).ledger_guard_marker;
       expected = null;
+    };
+    testConfigurationPathsKeepDependencies = {
+      expr = builtins.all (unit: builtins.getContext (configurationPath unit) != { }) [
+        service
+        guardedService
+      ];
+      expected = true;
     };
     testGuardedLedgerMarkerOutsideState = {
       expr = markerRejected {
