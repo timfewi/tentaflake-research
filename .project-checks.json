@@ -23,7 +23,7 @@
       "name": "client-package-evaluation",
       "argv": [
         "nix", "eval", "--raw", "--no-write-lock-file",
-        "path:.#checks.x86_64-linux.client-packaging.drvPath"
+        ".#checks.x86_64-linux.client-packaging.drvPath"
       ],
       "requires": ["nix"],
       "timeout_seconds": 120,
@@ -72,5 +72,6 @@
         "full"
       ]
     }
-  ]
+  ],
+  "watch_ignore": [".devenv", ".direnv", "target", "result", "result-*"]
 }

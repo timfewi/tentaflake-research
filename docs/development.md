@@ -1,11 +1,21 @@
 # Development
 
+Use `devenv shell` for the native default environment, or `devenv shell -- <command>`
+for one command. `devenv.nix` reuses the default Flake shell, including its compiler,
+build inputs and hooks; `flake.lock` remains the project toolchain pin.
+`devenv.yaml` and `devenv.lock` pin the native 2.4.0 runtime separately.
+After owner-managed shell-hook activation, review the configuration and explicitly
+run `devenv allow` only if you want automatic entry. `nix develop .` and existing
+named Flake shells remain available. The bridge uses Git-filtered source: new
+source files must be reviewed and Git-tracked before evaluation; never use
+`path:.` to copy ignored state into the Nix store. `.devenv/` is local ignored state.
+
 Use the pinned Linux x86_64 Nix shell. Build artifacts must fit on the selected
 filesystem; `/tmp` can be too small. Source checks never activate host services or
 call paid providers. Fetch locked dependencies once before offline Cargo checks.
 
 ```sh
-nix develop path:.
+nix develop .
 cargo fetch --locked
 check_scratch="$(mktemp -d /var/tmp/tentaflake-research-check.XXXXXX)"
 TMPDIR="$check_scratch" project-check fast

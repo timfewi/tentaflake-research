@@ -25,7 +25,7 @@
 - Keep README.md, SECURITY.md, docs/ and checks synchronized with behavior.
 - Use Conventional Commits and DCO signoff (`git commit -s`).
 - Missing tools or offline dependencies are environment blockers, not failures.
-  Enter the pinned toolchain with `nix develop path:.` (or reload direnv).
+  Enter the pinned toolchain with `devenv shell` (or `nix develop .`).
   `just lint --json` and `just verify --json` forward options to project-check.
 - Task-scoped staging is authorized. After review and required checks, commit
   the task changes and push to the current branch's existing upstream. Preserve

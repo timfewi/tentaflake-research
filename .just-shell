@@ -20,7 +20,7 @@ fi
 case "$status" in
     126|127)
         printf 'recipe: blocked (exit %s): a command is missing or cannot be executed.\n' "$status" >&2
-        printf 'Enter the project toolchain with nix develop path:. (or reload direnv), then retry.\n' >&2
+        printf 'Enter the project toolchain with devenv shell (or nix develop .), then retry.\n' >&2
         printf 'If it still fails, declare the missing tool in flake.nix devShells; project-check must be included too.\n' >&2
         ;;
     *)
