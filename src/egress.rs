@@ -373,6 +373,12 @@ fn parse_header(bytes: &[u8]) -> Result<ProxyRequest> {
         &target.url()[url::Position::BeforeHost..url::Position::AfterPort]
     )
     .into_bytes();
+    // Only the authenticated service peer can add this one-hop marker. It is
+    // never forwarded to the origin; without it, browser/ordinary validators
+    // continue to be stripped at this independent network boundary.
+    let conditional = request.headers.iter().any(|header| {
+        header.name.eq_ignore_ascii_case("x-research-conditional") && header.value == b"1"
+    });
     if method == "POST" {
         forwarded.extend_from_slice(format!("Content-Length: {body_bytes}\r\n").as_bytes());
     }
@@ -404,11 +410,12 @@ fn parse_header(bytes: &[u8]) -> Result<ProxyRequest> {
                 | "range"
                 | "content-type"
                 | "origin"
-        ) || (method == "OPTIONS"
-            && matches!(
-                name.as_str(),
-                "access-control-request-method" | "access-control-request-headers"
-            ))
+        ) || (conditional && matches!(name.as_str(), "if-none-match" | "if-modified-since"))
+            || (method == "OPTIONS"
+                && matches!(
+                    name.as_str(),
+                    "access-control-request-method" | "access-control-request-headers"
+                ))
         {
             forwarded.extend_from_slice(header.name.as_bytes());
             forwarded.extend_from_slice(b": ");
@@ -744,6 +751,17 @@ mod tests {
         assert!(!forwarded.contains("if-none-match:"));
         assert!(!forwarded.contains("if-modified-since:"));
         assert!(forwarded.contains("range: bytes=0-9"));
+    }
+
+    #[test]
+    fn selected_conditional_validators_reach_plaintext_origin_without_marker() {
+        let request = parse_header(b"GET http://example.com/page HTTP/1.1\r\nX-Research-Conditional: 1\r\nIf-None-Match: \"selected-tag\"\r\nIf-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT\r\n\r\n").unwrap();
+        let forwarded = String::from_utf8(request.forwarded.unwrap())
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(forwarded.contains("if-none-match: \"selected-tag\""));
+        assert!(forwarded.contains("if-modified-since: sun, 06 nov 1994 08:49:37 gmt"));
+        assert!(!forwarded.contains("x-research-conditional"));
     }
 
     #[test]

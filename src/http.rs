@@ -22,6 +22,8 @@ use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+const CONDITIONAL_PROXY_HEADER: &str = "x-research-conditional";
+
 pub struct ProxyRelay {
     url: String,
     task: JoinHandle<()>,
@@ -243,6 +245,7 @@ fn restrict_request_metadata(request: &mut HttpRequest) -> Result<()> {
     // tunnel hides headers from the egress proxy.
     // Validators can link separate visits. Only the selected-page revalidation
     // path may retain them; Chromium's cache is disabled for controlled targets.
+    request.headers.remove(CONDITIONAL_PROXY_HEADER);
     if !request.conditional {
         request.headers.remove(IF_NONE_MATCH);
         request.headers.remove(IF_MODIFIED_SINCE);
@@ -477,6 +480,14 @@ impl ProtectedHttp {
             return Err(ErrorCode::InvalidRequest);
         }
         restrict_request_metadata(&mut request)?;
+        // The plaintext relay cannot see `HttpRequest::conditional`. Give that
+        // authenticated service boundary a one-hop signal, removed by egress
+        // before forwarding. HTTPS uses CONNECT and needs no relay-visible tag.
+        if request.conditional && request.target.url().scheme() == "http" {
+            request
+                .headers
+                .insert(CONDITIONAL_PROXY_HEADER, HeaderValue::from_static("1"));
+        }
         let job_state = self.ledger.get(owner, job)?;
         let remaining = job_state.deadline_at - chrono::Utc::now().timestamp();
         if remaining <= 0 {
