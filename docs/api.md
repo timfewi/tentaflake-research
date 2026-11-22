@@ -22,7 +22,7 @@ service-authored categorical fields and never include tool input or source data.
 | --- | --- | --- |
 | `research_job` | `operation`: `providers`, `readiness`, `start`, `status`, `finish`, `cancel`; `job_id` for status/finish/cancel; optional reduced `limits` on start | Configuration or admission snapshot; otherwise job state, budgets, granted capabilities and available source IDs |
 | `research_search` | `job_id`, `queries`: objects with `q`, optional `count`, `language`, `country`, `freshness` | Per-query state, snippets, source, provider, cache hit, coverage and usage |
-| `research_fetch` | `job_id`, `urls`, optional `mode`: `auto`, `http`, `browser`, `provider`; optional `crawl` (`pages`, `depth`) with `http`/`auto` | Per-URL state, source, raw-source ID, link preview, complete links representation, extraction error, JavaScript need and an optional bounded-crawl summary |
+| `research_fetch` | `job_id`, `urls`, optional `mode`: `auto`, `http`, `browser`, `provider`; optional `crawl` (`pages`, `depth`) with `http`/`auto`; optional `language`; optional `revalidate_source_id` for one URL in explicit `http` mode | Per-URL state, source, raw-source ID, retrieval receipt, link preview, complete links representation, extraction error, JavaScript need and an optional bounded-crawl summary |
 | `research_browser` | `action`: `open`, `read`, `follow_link`, `expand`, `scroll`, `close`, with job/session/versioned reference as applicable | Session ID, observed page/references, DOM and text sources, cumulative HTTP receipts, partial/error state |
 | `research_read` | `kind`: `metadata`, `source`, `pdf_page`, `report`; optional expansion `summary` (below) | Saved metadata or exact bounded evidence/report chunk; summaries retain separate evidence |
 
@@ -159,6 +159,26 @@ representations. Strict privacy disables scrape providers; an unavailable or
 unconfigured provider returns `provider_unavailable`.
 Provider fetch consumes one document per selected item before the robots check,
 regardless of provider retries or fallback; zero document budget admits none.
+
+HTTP mode also supports opt-in conditional retrieval. `language` is a bounded
+language tag authored by the service as `Accept-Language` and becomes part of
+the cache and validator identity. `revalidate_source_id` is valid only with one
+URL, explicit `mode: "http"`, and no crawl. It must identify an authorized raw
+HTTP representation previously fetched for the same caller, privacy scope,
+requested URL and language variant. The caller never supplies an ETag,
+Last-Modified value or arbitrary header.
+
+The HTTP item includes `retrieval`: `kind` is `fresh`, `cache_hit`, or
+`validated_not_modified`; `origin_status` is the actual status associated with
+that outcome; `etag` and `last_modified` contain only bounded, syntactically
+eligible origin validators; `final_url` is the checked final URL;
+`entity_bytes` is the decoded entity size; and `source_id` references the raw
+evidence. A matched bodyless 304 reuses that source and its verified bytes,
+does not create or charge a new entity, and carries validators forward when
+the 304 omits them. A 200, including one with no validator, is ordinary fresh
+evidence. An unsolicited or unmatched 304 is rejected and creates no evidence.
+Ordinary fetches retain their existing cache behavior and never disclose
+validators in outbound requests.
 
 `crawl` is an optional object, `{"pages": <1..=32>, "depth": <0..=4>}`, and is
 valid only with `mode` `http` or `auto` (with `browser` or `provider` it is

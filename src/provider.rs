@@ -322,6 +322,7 @@ impl Brave {
                 micro_usd: self.price,
                 errors_are_unbilled: true,
                 query: true,
+                conditional: false,
             };
             // Transport failures have uncertain billing: never automatically retry.
             let response = http
@@ -474,6 +475,7 @@ impl Searxng {
                 micro_usd: self.price,
                 errors_are_unbilled: true,
                 query: true,
+                conditional: false,
             };
             // Transport failures have uncertain billing: never automatically retry.
             let response = if self.local {
@@ -632,6 +634,7 @@ impl Tavily {
             // must not trigger another automatic request.
             errors_are_unbilled: false,
             query: true,
+            conditional: false,
         };
         let response = http
             .post(context.owner, context.job, request, body, &context.stop)
@@ -800,6 +803,7 @@ impl Firecrawl {
                 // HTTP error releases its hold (docs/provider-adapters.md §5).
                 errors_are_unbilled: true,
                 query: false,
+                conditional: false,
             };
             // Transport failures have uncertain billing: never automatically retry.
             let response = http
@@ -1098,6 +1102,7 @@ impl Spider {
                     micro_usd: self.price,
                     errors_are_unbilled: false,
                     query: true,
+                    conditional: false,
                 },
                 body,
                 &context.stop,
@@ -1177,6 +1182,7 @@ impl Spider {
             micro_usd: self.price,
             errors_are_unbilled: false,
             query: false,
+            conditional: false,
         };
         let response = http
             .post(context.owner, context.job, request, body, &context.stop)
@@ -1517,6 +1523,7 @@ impl OpenAi {
             // never automatically replay a 429.
             errors_are_unbilled: false,
             query: false,
+            conditional: false,
         };
         let response = http
             .post(context.owner, context.job, request, body, &context.stop)

@@ -58,6 +58,11 @@ passing a synthetic fixture is not proof of arbitrary escape resistance.
 Public addresses can still receive user-supplied URL/query information. This tool
 does not implement organization-specific data-loss prevention. Operators must
 review grants, clients, retention and destination policy for their deployment.
+Opt-in HTTP revalidation can reveal to the same public representation that the
+authorized caller observed an earlier version. Validators are treated as
+bounded opaque origin data and are disclosed outbound only when the prior
+source, caller, privacy scope, requested/final URL and language variant match.
+Ordinary HTTP and browser traffic continues to strip conditional headers.
 
 Do not expose the Unix socket through an unauthenticated TCP/HTTP listener. Do not
 mount host roots, Docker sockets, private configuration or the whole Nix store

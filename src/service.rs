@@ -1424,8 +1424,22 @@ impl Service {
                     return Err(ErrorCode::InvalidRequest);
                 }
                 let FetchArgs {
-                    urls, mode, crawl, ..
+                    urls,
+                    mode,
+                    crawl,
+                    language,
+                    revalidate_source_id,
+                    ..
                 } = args;
+                FetchArgs {
+                    job_id: context.job,
+                    urls: urls.clone(),
+                    mode,
+                    crawl,
+                    language: language.clone(),
+                    revalidate_source_id,
+                }
+                .validate_representation()?;
                 if let Some(crawl) = crawl {
                     // Crawling is local HTTP discovery. Browser rendering and
                     // explicit scrape providers are not crawl transports, so a
@@ -1438,7 +1452,9 @@ impl Service {
                 self.batch(
                     context,
                     urls.into_iter()
-                        .map(|url| Input::Fetch(url, mode, crawl))
+                        .map(|url| {
+                            Input::Fetch(url, mode, crawl, language.clone(), revalidate_source_id)
+                        })
                         .collect(),
                 )
                 .await
@@ -1510,9 +1526,18 @@ impl Service {
                         },
                         Err(error) => Item::failed(index, error),
                     },
-                    Input::Fetch(url, mode, crawl) => {
-                        self.fetch_item(context, index, &url, mode, crawl, browser_slots)
-                            .await
+                    Input::Fetch(url, mode, crawl, language, revalidate) => {
+                        self.fetch_item(
+                            context,
+                            index,
+                            &url,
+                            mode,
+                            crawl,
+                            language.as_deref(),
+                            revalidate,
+                            browser_slots,
+                        )
+                        .await
                     }
                 }
             })
@@ -1559,6 +1584,8 @@ impl Service {
         url: &str,
         mode: FetchMode,
         crawl: Option<CrawlArgs>,
+        language: Option<&str>,
+        revalidate: Option<Uuid>,
         slots: &Semaphore,
     ) -> Item {
         let target = match PublicUrl::parse(url) {
@@ -1574,7 +1601,15 @@ impl Service {
         if matches!(mode, FetchMode::Provider) {
             return self.scrape_item(context, index, &target).await;
         }
-        let record = match self.fetcher.fetch(context, &target).await {
+        let fetched = match revalidate {
+            Some(source) => {
+                self.fetcher
+                    .revalidate(context, &target, language, source)
+                    .await
+            }
+            None => self.fetcher.fetch_variant(context, &target, language).await,
+        };
+        let record = match fetched {
             Ok(record) => record,
             Err(error) => return Item::failed(index, error),
         };
@@ -1625,7 +1660,7 @@ impl Service {
             data: Some(
                 json!({"source":SourceBrief::from(&record.source),"raw_source_id":record.raw_source_id,"title":record.title,
                 "links":links,"links_truncated":links_truncated,"links_representation":record.source.representations.iter().find(|rep| rep.kind == RepresentationKind::Links),
-                "cache_hit":record.cache_hit,"javascript_required":record.javascript_hint}),
+                "cache_hit":record.cache_hit,"javascript_required":record.javascript_hint,"retrieval":record.retrieval}),
             ),
             error: record.error,
             duplicate_of: None,
@@ -2512,21 +2547,30 @@ impl Work {
 }
 enum Input {
     Search(SearchQuery),
-    Fetch(String, FetchMode, Option<CrawlArgs>),
+    Fetch(
+        String,
+        FetchMode,
+        Option<CrawlArgs>,
+        Option<String>,
+        Option<Uuid>,
+    ),
 }
 impl Input {
     fn key(&self) -> String {
         match self {
             Self::Search(query) => serde_json::to_string(query).expect("serializable query"),
-            Self::Fetch(url, _, crawl) => {
+            Self::Fetch(url, _, crawl, language, revalidate) => {
                 let base = PublicUrl::parse(url)
                     .map(|url| url.request_url().to_string())
                     .unwrap_or_else(|_| url.clone());
                 match crawl {
                     Some(crawl) => {
-                        format!("{base}|crawl:{}:{}", crawl.pages, crawl.depth)
+                        format!(
+                            "{base}|crawl:{}:{}|{:?}|{:?}",
+                            crawl.pages, crawl.depth, language, revalidate
+                        )
                     }
-                    None => base,
+                    None => format!("{base}|{:?}|{:?}", language, revalidate),
                 }
             }
         }

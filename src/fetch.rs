@@ -12,9 +12,9 @@ use crate::provider::Context;
 use crate::robots::{AccessKind, RobotsDocument};
 use crate::store::EvidenceStore;
 use crate::worker::{self, DocumentKind, ExtractionInput, ParsedDocument, PdfInfo, WorkerConfig};
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -193,6 +193,41 @@ pub struct FetchRecord {
     pub error: Option<ErrorCode>,
     pub cache_hit: bool,
     pub javascript_hint: bool,
+    pub retrieval: RetrievalReceipt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalKind {
+    Fresh,
+    CacheHit,
+    ValidatedNotModified,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalReceipt {
+    pub kind: RetrievalKind,
+    pub origin_status: u16,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub final_url: String,
+    pub entity_bytes: u64,
+    pub source_id: uuid::Uuid,
+}
+
+#[derive(Clone)]
+struct ConditionalState {
+    owner: u32,
+    job: Option<uuid::Uuid>,
+    original: String,
+    language: Option<String>,
+    record: FetchRecord,
+}
+
+#[derive(Default)]
+struct ConditionalRecords {
+    values: HashMap<uuid::Uuid, ConditionalState>,
+    order: VecDeque<uuid::Uuid>,
 }
 
 /// One browser HTTP entity, retained before access/error handling. It is never
@@ -231,6 +266,7 @@ pub struct Fetcher {
     store: Arc<EvidenceStore>,
     robots: Cache<RobotsDocument>,
     documents: Cache<FetchRecord>,
+    conditional: std::sync::Mutex<ConditionalRecords>,
 }
 
 impl Fetcher {
@@ -251,6 +287,7 @@ impl Fetcher {
             store,
             robots: Cache::new(256, 8 * 1024 * 1024)?,
             documents: Cache::new(512, 16 * 1024 * 1024)?,
+            conditional: std::sync::Mutex::new(ConditionalRecords::default()),
         })
     }
 
@@ -265,7 +302,14 @@ impl Fetcher {
 
     pub fn finish_job(&self, owner: u32, job: uuid::Uuid) -> Result<()> {
         self.robots.remove_job(owner, job)?;
-        self.documents.remove_job(owner, job)
+        self.documents.remove_job(owner, job)?;
+        let mut records = self.conditional.lock().map_err(|_| ErrorCode::Storage)?;
+        records
+            .values
+            .retain(|_, state| state.owner != owner || state.job != Some(job));
+        let live: HashSet<_> = records.values.keys().copied().collect();
+        records.order.retain(|id| live.contains(id));
+        Ok(())
     }
 
     pub fn maintenance(&self) -> Result<()> {
@@ -523,6 +567,15 @@ impl Fetcher {
     }
 
     pub async fn fetch(&self, context: &Context, target: &PublicUrl) -> Result<FetchRecord> {
+        self.fetch_variant(context, target, None).await
+    }
+
+    pub async fn fetch_variant(
+        &self,
+        context: &Context,
+        target: &PublicUrl,
+        language: Option<&str>,
+    ) -> Result<FetchRecord> {
         if context.stop.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
@@ -541,14 +594,16 @@ impl Fetcher {
             )?
             .finish_serialized(0, Some(0))
             .await?;
-        let key = self.key(context, target.as_str())?;
+        let key = self.key(context, &(target.as_str(), language))?;
         // An archive may evict evidence earlier than the HTTP freshness window.
         // Retry initialization once after invalidation, without returning dead IDs.
         for _ in 0..2 {
             let (value, hit) = self
                 .documents
                 .get_or_init_cancellable(key.clone(), &context.stop, || async {
-                    let (record, ttl) = self.uncached(context, &target).await?;
+                    let (record, ttl) = self
+                        .uncached(context, &target, language, None, None)
+                        .await?;
                     let weight = serde_json::to_vec(&record)
                         .map_err(|_| ErrorCode::Storage)?
                         .len();
@@ -558,6 +613,9 @@ impl Fetcher {
             if self.store.get(context.owner, value.source.id).await.is_ok() {
                 let mut record = (*value).clone();
                 record.cache_hit = hit;
+                if hit {
+                    record.retrieval.kind = RetrievalKind::CacheHit;
+                }
                 return Ok(record);
             }
             self.documents.invalidate(&key)?;
@@ -569,6 +627,9 @@ impl Fetcher {
         &self,
         context: &Context,
         original: &PublicUrl,
+        language: Option<&str>,
+        validators: Option<(&str, Option<&str>, Option<&str>)>,
+        prior: Option<&FetchRecord>,
     ) -> Result<(FetchRecord, Duration)> {
         let mut target = original.clone();
         let mut seen = HashSet::new();
@@ -586,7 +647,13 @@ impl Fetcher {
                 warnings.push(SourceWarning::RobotsUnavailable);
             }
             let response = self
-                .read_attempts(context, &target, self.config.limits.pdf_bytes)
+                .read_attempts(
+                    context,
+                    &target,
+                    self.config.limits.pdf_bytes,
+                    language,
+                    validators.filter(|(final_url, _, _)| *final_url == target.as_str()),
+                )
                 .await?;
             if [301, 302, 303, 307, 308].contains(&response.status) {
                 if redirect == self.config.limits.redirects {
@@ -605,6 +672,20 @@ impl Fetcher {
             }
         }
         let response = final_response.ok_or(ErrorCode::InvalidResponse)?;
+        if response.status == 304 {
+            if !response.body.is_empty() {
+                return Err(ErrorCode::InvalidResponse);
+            }
+            let mut record = prior.cloned().ok_or(ErrorCode::InvalidResponse)?;
+            record.cache_hit = false;
+            record.retrieval.kind = RetrievalKind::ValidatedNotModified;
+            record.retrieval.origin_status = 304;
+            record.retrieval.etag = eligible_etag(&response.headers).or(record.retrieval.etag);
+            record.retrieval.last_modified =
+                eligible_last_modified(&response.headers).or(record.retrieval.last_modified);
+            self.remember(context, original, language, &record)?;
+            return Ok((record, Duration::ZERO));
+        }
         let retrieved_at = chrono::Utc::now().timestamp();
         let raw_source = self
             .store
@@ -630,6 +711,15 @@ impl Fetcher {
             error: None,
             cache_hit: false,
             javascript_hint: false,
+            retrieval: RetrievalReceipt {
+                kind: RetrievalKind::Fresh,
+                origin_status: response.status,
+                etag: eligible_etag(&response.headers),
+                last_modified: eligible_last_modified(&response.headers),
+                final_url: target.as_str().to_owned(),
+                entity_bytes: response.body.len() as u64,
+                source_id: raw_source.id,
+            },
         };
         let processed = self.process(context, &target, &response).await;
         match processed {
@@ -708,7 +798,93 @@ impl Fetcher {
         } else {
             cache_ttl(&response.headers, self.config.retention.cache_seconds)
         };
+        record.retrieval.source_id = record.raw_source_id;
+        self.remember(context, original, language, &record)?;
         Ok((record, ttl))
+    }
+
+    pub async fn revalidate(
+        &self,
+        context: &Context,
+        target: &PublicUrl,
+        language: Option<&str>,
+        source: uuid::Uuid,
+    ) -> Result<FetchRecord> {
+        let target = target.without_fragment();
+        let prior = {
+            let records = self.conditional.lock().map_err(|_| ErrorCode::Storage)?;
+            records
+                .values
+                .get(&source)
+                .cloned()
+                .ok_or(ErrorCode::SourceExpired)?
+        };
+        self.store.get(context.owner, source).await?;
+        if prior.owner != context.owner
+            || prior.job.is_some_and(|job| job != context.job)
+            || prior.original != target.as_str()
+            || prior.language.as_deref() != language
+        {
+            return Err(ErrorCode::PermissionDenied);
+        }
+        let old = &prior.record.retrieval;
+        if old.etag.is_none() && old.last_modified.is_none() {
+            return Err(ErrorCode::InvalidRequest);
+        }
+        self.ledger
+            .reserve(
+                context.owner,
+                context.job,
+                Charge {
+                    documents: 1,
+                    ..Charge::default()
+                },
+            )?
+            .finish_serialized(0, Some(0))
+            .await?;
+        self.uncached(
+            context,
+            &target,
+            language,
+            Some((
+                &old.final_url,
+                old.etag.as_deref(),
+                old.last_modified.as_deref(),
+            )),
+            Some(&prior.record),
+        )
+        .await
+        .map(|v| v.0)
+    }
+
+    fn remember(
+        &self,
+        context: &Context,
+        original: &PublicUrl,
+        language: Option<&str>,
+        record: &FetchRecord,
+    ) -> Result<()> {
+        let mut records = self.conditional.lock().map_err(|_| ErrorCode::Storage)?;
+        let id = record.raw_source_id;
+        if !records.values.contains_key(&id) {
+            records.order.push_back(id);
+        }
+        records.values.insert(
+            id,
+            ConditionalState {
+                owner: context.owner,
+                job: (self.config.privacy == Privacy::Strict).then_some(context.job),
+                original: original.as_str().to_owned(),
+                language: language.map(str::to_owned),
+                record: record.clone(),
+            },
+        );
+        while records.values.len() > 512 {
+            if let Some(old) = records.order.pop_front() {
+                records.values.remove(&old);
+            }
+        }
+        Ok(())
     }
 
     async fn process(
@@ -906,7 +1082,13 @@ impl Fetcher {
                 return Err(ErrorCode::InvalidResponse);
             }
             let response = self
-                .read_attempts(context, &target, self.config.robots.max_bytes as u64)
+                .read_attempts(
+                    context,
+                    &target,
+                    self.config.robots.max_bytes as u64,
+                    None,
+                    None,
+                )
                 .await?;
             if [301, 302, 303, 307, 308].contains(&response.status) {
                 if redirect == self.config.limits.redirects {
@@ -953,22 +1135,46 @@ impl Fetcher {
         context: &Context,
         target: &PublicUrl,
         maximum: u64,
+        language: Option<&str>,
+        validators: Option<(&str, Option<&str>, Option<&str>)>,
     ) -> Result<HttpResponse> {
         for attempt in 0..=self.config.limits.retries {
+            let mut headers: HeaderMap = [(
+                "accept".parse().map_err(|_| ErrorCode::InvalidRequest)?,
+                HeaderValue::from_static(
+                    "text/html,application/pdf,text/plain,application/json;q=0.8,*/*;q=0.1",
+                ),
+            )]
+            .into_iter()
+            .collect();
+            if let Some(language) = language {
+                headers.insert(
+                    "accept-language",
+                    HeaderValue::from_str(language).map_err(|_| ErrorCode::InvalidRequest)?,
+                );
+            }
+            if let Some((_, etag, modified)) = validators {
+                if let Some(etag) = etag {
+                    headers.insert(
+                        IF_NONE_MATCH,
+                        HeaderValue::from_str(etag).map_err(|_| ErrorCode::InvalidRequest)?,
+                    );
+                }
+                if let Some(modified) = modified {
+                    headers.insert(
+                        IF_MODIFIED_SINCE,
+                        HeaderValue::from_str(modified).map_err(|_| ErrorCode::InvalidRequest)?,
+                    );
+                }
+            }
             let request = HttpRequest {
                 target: target.clone(),
-                headers: [(
-                    "accept".parse().map_err(|_| ErrorCode::InvalidRequest)?,
-                    HeaderValue::from_static(
-                        "text/html,application/pdf,text/plain,application/json;q=0.8,*/*;q=0.1",
-                    ),
-                )]
-                .into_iter()
-                .collect(),
+                headers,
                 max_bytes: maximum,
                 micro_usd: 0,
                 errors_are_unbilled: false,
                 query: false,
+                conditional: validators.is_some(),
             };
             let response = self
                 .http
@@ -1103,13 +1309,42 @@ fn raw(bytes: &[u8]) -> Evidence {
     }
 }
 
+const MAX_VALIDATOR_BYTES: usize = 1024;
+
+fn eligible_etag(headers: &HeaderMap) -> Option<String> {
+    let values: Vec<_> = headers.get_all("etag").iter().collect();
+    if values.len() != 1 {
+        return None;
+    }
+    let value = values[0].to_str().ok()?;
+    let tag = value.strip_prefix("W/").unwrap_or(value);
+    (value.len() <= MAX_VALIDATOR_BYTES
+        && tag.len() >= 2
+        && tag.starts_with('"')
+        && tag.ends_with('"')
+        && tag[1..tag.len() - 1]
+            .bytes()
+            .all(|b| b == 0x21 || (0x23..=0x7e).contains(&b) || b >= 0x80))
+    .then(|| value.to_owned())
+}
+
+fn eligible_last_modified(headers: &HeaderMap) -> Option<String> {
+    let values: Vec<_> = headers.get_all("last-modified").iter().collect();
+    if values.len() != 1 {
+        return None;
+    }
+    let value = values[0].to_str().ok()?;
+    (value.len() <= MAX_VALIDATOR_BYTES && chrono::DateTime::parse_from_rfc2822(value).is_ok())
+        .then(|| value.to_owned())
+}
+
 pub fn cache_ttl(headers: &HeaderMap, maximum: u64) -> Duration {
     if headers.contains_key("set-cookie") {
         return Duration::ZERO;
     }
     // Document requests use one fixed Accept value and one client per Fetcher.
-    // Accept-Encoding, Accept-Language (absent) and User-Agent are therefore
-    // stable for this cache; other request-dependent responses cannot be reused.
+    // Accept-Encoding and User-Agent are fixed; optional Accept-Language is in
+    // the Fetcher cache key. Other request-dependent responses cannot be reused.
     for vary in headers.get_all("vary").iter() {
         if vary.to_str().ok().is_none_or(|v| {
             v.split(',').any(|name| {
@@ -1218,6 +1453,7 @@ mod tests {
     struct Fixture {
         routes: HashMap<&'static str, Route>,
         calls: Mutex<Vec<String>>,
+        observed: Mutex<Vec<HeaderMap>>,
         barrier: Option<tokio::sync::Barrier>,
     }
     #[async_trait::async_trait]
@@ -1230,10 +1466,37 @@ mod tests {
             _: &CancellationToken,
         ) -> Result<HttpResponse> {
             let path = request.target.url().path();
+            self.observed.lock().unwrap().push(request.headers.clone());
+            let prior_calls = self
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|seen| seen.as_str() == path)
+                .count();
             self.calls.lock().unwrap().push(path.to_owned());
             assert!(!request.headers.contains_key("authorization"));
             assert!(!request.headers.contains_key("x-subscription-token"));
             let route = self.routes.get(path).ok_or(ErrorCode::EgressUnavailable)?;
+            if matches!(path, "/conditional" | "/modified-only") && prior_calls == 1 {
+                return Ok(HttpResponse {
+                    status: 304,
+                    body: vec![],
+                    headers: HeaderMap::new(),
+                });
+            }
+            if path == "/conditional" && prior_calls == 2 {
+                return Ok(HttpResponse {
+                    status: 200,
+                    body: b"changed\0bytes".to_vec(),
+                    headers: [(
+                        "content-type".parse().unwrap(),
+                        HeaderValue::from_static("text/plain"),
+                    )]
+                    .into_iter()
+                    .collect(),
+                });
+            }
             if path != "/robots.txt"
                 && let Some(barrier) = &self.barrier
             {
@@ -1347,6 +1610,7 @@ mod tests {
         let transport = Arc::new(Fixture {
             routes,
             calls: Mutex::new(vec![]),
+            observed: Mutex::new(vec![]),
             barrier: barrier.then(|| tokio::sync::Barrier::new(2)),
         });
         let parser = Arc::new(FixtureParser {
@@ -1366,6 +1630,178 @@ mod tests {
     }
     fn target(path: &str) -> PublicUrl {
         PublicUrl::parse(&format!("https://example.com{path}")).unwrap()
+    }
+
+    #[test]
+    fn response_validators_are_bounded_and_syntactically_eligible() {
+        let mut headers = HeaderMap::new();
+        headers.insert("etag", HeaderValue::from_static("W/\"v1\""));
+        headers.insert(
+            "last-modified",
+            HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        assert_eq!(eligible_etag(&headers).as_deref(), Some("W/\"v1\""));
+        assert_eq!(
+            eligible_last_modified(&headers).as_deref(),
+            Some("Sun, 06 Nov 1994 08:49:37 GMT")
+        );
+        headers.insert("etag", HeaderValue::from_static("unquoted"));
+        headers.insert("last-modified", HeaderValue::from_static("tomorrow"));
+        assert_eq!(eligible_etag(&headers), None);
+        assert_eq!(eligible_last_modified(&headers), None);
+        headers.insert(
+            "etag",
+            HeaderValue::from_str(&format!("\"{}\"", "x".repeat(MAX_VALIDATOR_BYTES))).unwrap(),
+        );
+        assert_eq!(eligible_etag(&headers), None);
+    }
+
+    #[tokio::test]
+    async fn conditional_fetch_reuses_304_evidence_then_archives_changed_200() {
+        let root = tempfile::tempdir().unwrap();
+        let mut entity = route(200, b"first\0binary", "text/plain");
+        entity
+            .headers
+            .insert("etag", HeaderValue::from_static("\"v1\""));
+        entity.headers.insert(
+            "last-modified",
+            HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        entity
+            .headers
+            .insert("cache-control", HeaderValue::from_static("max-age=60"));
+        let mut modified_only = route(200, b"last modified only", "text/plain");
+        modified_only.headers.insert(
+            "last-modified",
+            HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        let (fetcher, transport, _, store, context) = setup(
+            &root,
+            [
+                ("/robots.txt", route(404, b"", "text/plain")),
+                ("/conditional", entity),
+                ("/modified-only", modified_only),
+                ("/unsolicited", route(304, b"", "text/plain")),
+            ]
+            .into(),
+            false,
+            Privacy::Practical,
+        );
+        let conditional_target = target("/conditional");
+        let first = fetcher
+            .fetch_variant(&context, &conditional_target, Some("en-US"))
+            .await
+            .unwrap();
+        assert!(matches!(first.retrieval.kind, RetrievalKind::Fresh));
+        assert_eq!(first.retrieval.origin_status, 200);
+        assert_eq!(first.retrieval.entity_bytes, 12);
+        assert!(matches!(
+            fetcher
+                .revalidate(
+                    &context,
+                    &conditional_target,
+                    Some("fr-FR"),
+                    first.raw_source_id
+                )
+                .await,
+            Err(ErrorCode::PermissionDenied)
+        ));
+
+        let cached = fetcher
+            .fetch_variant(&context, &conditional_target, Some("en-US"))
+            .await
+            .unwrap();
+        assert!(matches!(cached.retrieval.kind, RetrievalKind::CacheHit));
+        assert_eq!(
+            transport
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| *p == "/conditional")
+                .count(),
+            1
+        );
+
+        let validated = fetcher
+            .revalidate(
+                &context,
+                &conditional_target,
+                Some("en-US"),
+                first.raw_source_id,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            validated.retrieval.kind,
+            RetrievalKind::ValidatedNotModified
+        ));
+        assert_eq!(validated.retrieval.origin_status, 304);
+        assert_eq!(validated.raw_source_id, first.raw_source_id);
+        let raw = store.get(context.owner, first.raw_source_id).await.unwrap();
+        let chunk = store
+            .read(
+                context.owner,
+                first.raw_source_id,
+                raw.representations[0].id,
+                None,
+                1024,
+            )
+            .await
+            .unwrap();
+        assert_eq!(chunk.total, 12);
+        assert_eq!(chunk.source_id, first.raw_source_id);
+        let conditional_headers = transport.observed.lock().unwrap().last().unwrap().clone();
+        assert_eq!(conditional_headers.get(IF_NONE_MATCH).unwrap(), "\"v1\"");
+        assert!(conditional_headers.contains_key(IF_MODIFIED_SINCE));
+
+        let changed = fetcher
+            .revalidate(
+                &context,
+                &conditional_target,
+                Some("en-US"),
+                first.raw_source_id,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(changed.retrieval.kind, RetrievalKind::Fresh));
+        assert_eq!(changed.retrieval.origin_status, 200);
+        assert_eq!(changed.retrieval.entity_bytes, 13);
+        assert_ne!(changed.raw_source_id, first.raw_source_id);
+        let source = store
+            .get(context.owner, changed.raw_source_id)
+            .await
+            .unwrap();
+        assert_eq!(source.representations[0].bytes, 13);
+        assert!(matches!(
+            fetcher
+                .revalidate(
+                    &context,
+                    &conditional_target,
+                    Some("en-US"),
+                    changed.raw_source_id
+                )
+                .await,
+            Err(ErrorCode::InvalidRequest)
+        ));
+        assert!(matches!(
+            fetcher.fetch(&context, &target("/unsolicited")).await,
+            Err(ErrorCode::InvalidResponse)
+        ));
+
+        let modified_target = target("/modified-only");
+        let modified = fetcher.fetch(&context, &modified_target).await.unwrap();
+        let validated = fetcher
+            .revalidate(&context, &modified_target, None, modified.raw_source_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            validated.retrieval.kind,
+            RetrievalKind::ValidatedNotModified
+        ));
+        let headers = transport.observed.lock().unwrap().last().unwrap().clone();
+        assert!(!headers.contains_key(IF_NONE_MATCH));
+        assert!(headers.contains_key(IF_MODIFIED_SINCE));
     }
 
     fn browser_input(path: &str) -> crate::browser::wire::HttpRequest {
