@@ -172,8 +172,11 @@ The HTTP item includes `retrieval`: `kind` is `fresh`, `cache_hit`, or
 `validated_not_modified`; `origin_status` is the actual status associated with
 that outcome; `etag` and `last_modified` contain only bounded, syntactically
 eligible origin validators; `final_url` is the checked final URL;
-`entity_bytes` is the decoded entity size; and `source_id` references the raw
-evidence. A matched bodyless 304 reuses that source and its verified bytes,
+`entity_bytes` is the decoded size of the complete representation referenced by
+`source_id`; `request_bytes` is the response-body byte count transferred for
+this request (the entity size for a fresh response, zero for a local cache hit
+or matched bodyless 304); and `source_id` references the raw evidence. A matched
+bodyless 304 reuses that source and its verified bytes,
 does not create or charge a new entity, and carries validators forward when
 the 304 omits them. A 200, including one with no validator, is ordinary fresh
 evidence. An unsolicited or unmatched 304 is rejected and creates no evidence.

@@ -211,6 +211,10 @@ pub struct RetrievalReceipt {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub final_url: String,
+    /// Bytes transferred in the response body for this request. Local cache
+    /// hits and matched bodyless 304 responses transfer no entity bytes.
+    pub request_bytes: u64,
+    /// Size of the complete representation referenced by `source_id`.
     pub entity_bytes: u64,
     pub source_id: uuid::Uuid,
 }
@@ -291,7 +295,7 @@ impl Fetcher {
         })
     }
 
-    fn key(&self, context: &Context, input: &str) -> Result<Key> {
+    fn key<T: Serialize + ?Sized>(&self, context: &Context, input: &T) -> Result<Key> {
         Key::new(
             context.owner,
             (self.config.privacy == Privacy::Strict).then_some(context.job),
@@ -615,6 +619,7 @@ impl Fetcher {
                 record.cache_hit = hit;
                 if hit {
                     record.retrieval.kind = RetrievalKind::CacheHit;
+                    record.retrieval.request_bytes = 0;
                 }
                 return Ok(record);
             }
@@ -684,6 +689,7 @@ impl Fetcher {
             record.cache_hit = false;
             record.retrieval.kind = RetrievalKind::ValidatedNotModified;
             record.retrieval.origin_status = 304;
+            record.retrieval.request_bytes = 0;
             record.retrieval.etag = eligible_etag(&response.headers).or(record.retrieval.etag);
             record.retrieval.last_modified =
                 eligible_last_modified(&response.headers).or(record.retrieval.last_modified);
@@ -721,6 +727,7 @@ impl Fetcher {
                 etag: eligible_etag(&response.headers),
                 last_modified: eligible_last_modified(&response.headers),
                 final_url: target.as_str().to_owned(),
+                request_bytes: response.body.len() as u64,
                 entity_bytes: response.body.len() as u64,
                 source_id: raw_source.id,
             },
@@ -846,19 +853,27 @@ impl Fetcher {
             )?
             .finish_serialized(0, Some(0))
             .await?;
-        self.uncached(
-            context,
-            &target,
-            language,
-            Some((
-                &old.final_url,
-                old.etag.as_deref(),
-                old.last_modified.as_deref(),
-            )),
-            Some(&prior.record),
-        )
-        .await
-        .map(|v| v.0)
+        let record = self
+            .uncached(
+                context,
+                &target,
+                language,
+                Some((
+                    &old.final_url,
+                    old.etag.as_deref(),
+                    old.last_modified.as_deref(),
+                )),
+                Some(&prior.record),
+            )
+            .await?
+            .0;
+        if matches!(record.retrieval.kind, RetrievalKind::Fresh) {
+            // A changed representation supersedes any still-fresh ordinary
+            // entry for this exact owner/privacy/URL/language partition.
+            self.documents
+                .invalidate(&self.key(context, &(target.as_str(), language))?)?;
+        }
+        Ok(record)
     }
 
     fn remember(
@@ -1501,14 +1516,20 @@ mod tests {
                     .collect(),
                 });
             }
-            if path == "/conditional" && prior_calls == 2 {
+            if path == "/conditional" && prior_calls >= 2 {
                 return Ok(HttpResponse {
                     status: 200,
                     body: b"changed\0bytes".to_vec(),
-                    headers: [(
-                        "content-type".parse().unwrap(),
-                        HeaderValue::from_static("text/plain"),
-                    )]
+                    headers: [
+                        (
+                            "content-type".parse().unwrap(),
+                            HeaderValue::from_static("text/plain"),
+                        ),
+                        (
+                            "cache-control".parse().unwrap(),
+                            HeaderValue::from_static("max-age=60"),
+                        ),
+                    ]
                     .into_iter()
                     .collect(),
                 });
@@ -1715,6 +1736,7 @@ mod tests {
             .unwrap();
         assert!(matches!(first.retrieval.kind, RetrievalKind::Fresh));
         assert_eq!(first.retrieval.origin_status, 200);
+        assert_eq!(first.retrieval.request_bytes, 12);
         assert_eq!(first.retrieval.entity_bytes, 12);
         assert!(matches!(
             fetcher
@@ -1733,6 +1755,8 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(cached.retrieval.kind, RetrievalKind::CacheHit));
+        assert_eq!(cached.retrieval.request_bytes, 0);
+        assert_eq!(cached.retrieval.entity_bytes, 12);
         assert_eq!(
             transport
                 .calls
@@ -1758,6 +1782,8 @@ mod tests {
             RetrievalKind::ValidatedNotModified
         ));
         assert_eq!(validated.retrieval.origin_status, 304);
+        assert_eq!(validated.retrieval.request_bytes, 0);
+        assert_eq!(validated.retrieval.entity_bytes, 12);
         assert_eq!(validated.raw_source_id, first.raw_source_id);
         let raw = store.get(context.owner, first.raw_source_id).await.unwrap();
         let chunk = store
@@ -1812,6 +1838,7 @@ mod tests {
             .unwrap();
         assert!(matches!(changed.retrieval.kind, RetrievalKind::Fresh));
         assert_eq!(changed.retrieval.origin_status, 200);
+        assert_eq!(changed.retrieval.request_bytes, 13);
         assert_eq!(changed.retrieval.entity_bytes, 13);
         assert_ne!(changed.raw_source_id, first.raw_source_id);
         let source = store
@@ -1819,6 +1846,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(source.representations[0].bytes, 13);
+        let ordinary_after_change = fetcher
+            .fetch_variant(&context, &conditional_target, Some("en-US"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ordinary_after_change.retrieval.kind,
+            RetrievalKind::Fresh
+        ));
+        assert_eq!(ordinary_after_change.retrieval.request_bytes, 13);
+        assert_eq!(ordinary_after_change.retrieval.entity_bytes, 13);
+        assert_eq!(
+            ordinary_after_change.retrieval.final_url,
+            conditional_target.as_str()
+        );
+        assert_ne!(ordinary_after_change.raw_source_id, first.raw_source_id);
+        let current = store
+            .get(context.owner, ordinary_after_change.raw_source_id)
+            .await
+            .unwrap();
+        let current_bytes = store
+            .read(
+                context.owner,
+                ordinary_after_change.raw_source_id,
+                current.representations[0].id,
+                None,
+                1024,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &current_bytes.content,
+            )
+            .unwrap(),
+            b"changed\0bytes"
+        );
+        assert_eq!(
+            transport
+                .observed
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .get("accept-language")
+                .unwrap(),
+            "en-US"
+        );
         assert!(matches!(
             fetcher
                 .revalidate(
