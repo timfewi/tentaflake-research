@@ -635,6 +635,7 @@ impl Fetcher {
         let mut seen = HashSet::new();
         let mut warnings = Vec::new();
         let mut final_response = None;
+        let mut final_was_conditional = false;
         for redirect in 0..=self.config.limits.redirects {
             if !seen.insert(target.request_url().to_string()) {
                 return Err(ErrorCode::InvalidResponse);
@@ -646,13 +647,15 @@ impl Fetcher {
             {
                 warnings.push(SourceWarning::RobotsUnavailable);
             }
+            let request_validators =
+                validators.filter(|(final_url, _, _)| *final_url == target.as_str());
             let response = self
                 .read_attempts(
                     context,
                     &target,
                     self.config.limits.pdf_bytes,
                     language,
-                    validators.filter(|(final_url, _, _)| *final_url == target.as_str()),
+                    request_validators,
                 )
                 .await?;
             if [301, 302, 303, 307, 308].contains(&response.status) {
@@ -667,13 +670,14 @@ impl Fetcher {
                     .map_err(|_| ErrorCode::InvalidResponse)?;
                 target = target.redirect(location)?.without_fragment();
             } else {
+                final_was_conditional = request_validators.is_some();
                 final_response = Some(response);
                 break;
             }
         }
         let response = final_response.ok_or(ErrorCode::InvalidResponse)?;
         if response.status == 304 {
-            if !response.body.is_empty() {
+            if !final_was_conditional || !response.body.is_empty() {
                 return Err(ErrorCode::InvalidResponse);
             }
             let mut record = prior.cloned().ok_or(ErrorCode::InvalidResponse)?;
@@ -1485,6 +1489,18 @@ mod tests {
                     headers: HeaderMap::new(),
                 });
             }
+            if path == "/redirect-conditional" && prior_calls == 1 {
+                return Ok(HttpResponse {
+                    status: 302,
+                    body: vec![],
+                    headers: [(
+                        "location".parse().unwrap(),
+                        HeaderValue::from_static("https://other.example/unsolicited"),
+                    )]
+                    .into_iter()
+                    .collect(),
+                });
+            }
             if path == "/conditional" && prior_calls == 2 {
                 return Ok(HttpResponse {
                     status: 200,
@@ -1675,12 +1691,17 @@ mod tests {
             "last-modified",
             HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
         );
+        let mut redirect_conditional = route(200, b"redirect original", "text/plain");
+        redirect_conditional
+            .headers
+            .insert("etag", HeaderValue::from_static("\"redirect-v1\""));
         let (fetcher, transport, _, store, context) = setup(
             &root,
             [
                 ("/robots.txt", route(404, b"", "text/plain")),
                 ("/conditional", entity),
                 ("/modified-only", modified_only),
+                ("/redirect-conditional", redirect_conditional),
                 ("/unsolicited", route(304, b"", "text/plain")),
             ]
             .into(),
@@ -1745,12 +1766,37 @@ mod tests {
                 first.raw_source_id,
                 raw.representations[0].id,
                 None,
-                1024,
+                10,
             )
             .await
             .unwrap();
         assert_eq!(chunk.total, 12);
         assert_eq!(chunk.source_id, first.raw_source_id);
+        assert!(chunk.truncated);
+        assert_eq!(chunk.start, 0);
+        assert_eq!(chunk.end, 6);
+        let mut replayed =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &chunk.content)
+                .unwrap();
+        let remainder = store
+            .read(
+                context.owner,
+                first.raw_source_id,
+                raw.representations[0].id,
+                chunk.next_cursor,
+                1024,
+            )
+            .await
+            .unwrap();
+        replayed.extend(
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &remainder.content,
+            )
+            .unwrap(),
+        );
+        assert_eq!(replayed, b"first\0binary");
+        assert!(!remainder.truncated);
         let conditional_headers = transport.observed.lock().unwrap().last().unwrap().clone();
         assert_eq!(conditional_headers.get(IF_NONE_MATCH).unwrap(), "\"v1\"");
         assert!(conditional_headers.contains_key(IF_MODIFIED_SINCE));
@@ -1802,6 +1848,27 @@ mod tests {
         let headers = transport.observed.lock().unwrap().last().unwrap().clone();
         assert!(!headers.contains_key(IF_NONE_MATCH));
         assert!(headers.contains_key(IF_MODIFIED_SINCE));
+
+        let redirect_target = target("/redirect-conditional");
+        let redirect_original = fetcher.fetch(&context, &redirect_target).await.unwrap();
+        assert!(matches!(
+            fetcher
+                .revalidate(
+                    &context,
+                    &redirect_target,
+                    None,
+                    redirect_original.raw_source_id,
+                )
+                .await,
+            Err(ErrorCode::InvalidResponse)
+        ));
+        let observed = transport.observed.lock().unwrap();
+        assert_eq!(
+            observed[observed.len() - 2].get(IF_NONE_MATCH).unwrap(),
+            "\"redirect-v1\""
+        );
+        assert!(!observed.last().unwrap().contains_key(IF_NONE_MATCH));
+        assert!(!observed.last().unwrap().contains_key(IF_MODIFIED_SINCE));
     }
 
     fn browser_input(path: &str) -> crate::browser::wire::HttpRequest {
