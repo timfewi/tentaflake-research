@@ -247,6 +247,7 @@ impl Transport for Upstream {
                 micro_usd: 0,
                 errors_are_unbilled: false,
                 query: false,
+                conditional: false,
             },
             stop,
         )

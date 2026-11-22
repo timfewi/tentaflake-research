@@ -22,6 +22,8 @@ use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+const CONDITIONAL_PROXY_HEADER: &str = "x-research-conditional";
+
 pub struct ProxyRelay {
     url: String,
     task: JoinHandle<()>,
@@ -135,6 +137,9 @@ pub struct HttpRequest {
     /// Search-provider request: consumes one search-query slot. Model judgment,
     /// summarization and document fetches only consume their other budgets.
     pub query: bool,
+    /// Only the selected-page revalidation implementation may set this. Tool
+    /// callers cannot deserialize HttpRequest or supply headers.
+    pub conditional: bool,
 }
 
 pub struct HttpResponse {
@@ -231,16 +236,27 @@ fn browser_request(target: PublicUrl, headers: HeaderMap, max_bytes: u64) -> Htt
         micro_usd: 0,
         errors_are_unbilled: false,
         query: false,
+        conditional: false,
     }
 }
 
 fn restrict_request_metadata(request: &mut HttpRequest) -> Result<()> {
     // Enforce the same floor at the last service boundary before an HTTPS
     // tunnel hides headers from the egress proxy.
-    // Validators can link separate visits; Research does not issue conditional
-    // requests, and Chromium's own cache is disabled for controlled targets.
-    request.headers.remove(IF_NONE_MATCH);
-    request.headers.remove(IF_MODIFIED_SINCE);
+    // Validators can link separate visits. Only the selected-page revalidation
+    // path may retain them; Chromium's cache is disabled for controlled targets.
+    request.headers.remove(CONDITIONAL_PROXY_HEADER);
+    if !request.conditional {
+        request.headers.remove(IF_NONE_MATCH);
+        request.headers.remove(IF_MODIFIED_SINCE);
+    } else if request.headers.keys().any(|name| {
+        !matches!(
+            name.as_str(),
+            "accept" | "accept-language" | "if-none-match" | "if-modified-since"
+        )
+    }) {
+        return Err(ErrorCode::InvalidRequest);
+    }
     if request.headers.get_all(REFERER).iter().nth(1).is_some()
         || request.headers.get_all(ORIGIN).iter().nth(1).is_some()
     {
@@ -464,6 +480,14 @@ impl ProtectedHttp {
             return Err(ErrorCode::InvalidRequest);
         }
         restrict_request_metadata(&mut request)?;
+        // The plaintext relay cannot see `HttpRequest::conditional`. Give that
+        // authenticated service boundary a one-hop signal, removed by egress
+        // before forwarding. HTTPS uses CONNECT and needs no relay-visible tag.
+        if request.conditional && request.target.url().scheme() == "http" {
+            request
+                .headers
+                .insert(CONDITIONAL_PROXY_HEADER, HeaderValue::from_static("1"));
+        }
         let job_state = self.ledger.get(owner, job)?;
         let remaining = job_state.deadline_at - chrono::Utc::now().timestamp();
         if remaining <= 0 {
@@ -716,6 +740,7 @@ mod tests {
             micro_usd: 0,
             errors_are_unbilled: false,
             query: false,
+            conditional: false,
         }
     }
 
@@ -830,6 +855,30 @@ mod tests {
         let sent = server.await.unwrap();
         assert!(!sent[0].contains("if-none-match:"));
         assert!(!sent[0].contains("if-modified-since:"));
+    }
+
+    #[test]
+    fn only_service_conditional_requests_retain_validators() {
+        let mut request = request();
+        request.conditional = true;
+        request
+            .headers
+            .insert(IF_NONE_MATCH, HeaderValue::from_static("\"observed\""));
+        request.headers.insert(
+            IF_MODIFIED_SINCE,
+            HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        restrict_request_metadata(&mut request).unwrap();
+        assert!(request.headers.contains_key(IF_NONE_MATCH));
+        assert!(request.headers.contains_key(IF_MODIFIED_SINCE));
+
+        request
+            .headers
+            .insert("x-injected", HeaderValue::from_static("no"));
+        assert_eq!(
+            restrict_request_metadata(&mut request),
+            Err(ErrorCode::InvalidRequest)
+        );
     }
 
     #[test]

@@ -130,6 +130,38 @@ pub struct FetchArgs {
     /// `auto`; it is not a general crawler and never crosses an origin boundary.
     #[serde(default)]
     pub crawl: Option<CrawlArgs>,
+    /// Opt-in HTTP representation language. This is service-authored as
+    /// Accept-Language and is part of the representation/cache identity.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Revalidate one previously returned HTTP representation. This is valid
+    /// only for a single URL in `http` mode and never accepts caller validators.
+    #[serde(default)]
+    pub revalidate_source_id: Option<Uuid>,
+}
+
+impl FetchArgs {
+    pub fn validate_representation(&self) -> Result<()> {
+        if self.language.as_ref().is_some_and(|value| {
+            value.is_empty()
+                || value.len() > 35
+                || value.starts_with('-')
+                || value.ends_with('-')
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        }) {
+            return Err(ErrorCode::InvalidRequest);
+        }
+        if self.revalidate_source_id.is_some()
+            && (self.urls.len() != 1
+                || !matches!(self.mode, FetchMode::Http)
+                || self.crawl.is_some())
+        {
+            return Err(ErrorCode::InvalidRequest);
+        }
+        Ok(())
+    }
 }
 
 /// Explicit bounded crawl request. The service follows only same-origin links
@@ -253,6 +285,39 @@ pub enum ReadArgs {
 // declaring the root object type that MCP requires for every inputSchema.
 fn object_root(schema: &mut schemars::Schema) {
     schema.insert("type".into(), serde_json::json!("object"));
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+
+    #[test]
+    fn conditional_fetch_is_explicit_and_variant_is_bounded() {
+        let source = Uuid::new_v4();
+        let valid = FetchArgs {
+            job_id: Uuid::new_v4(),
+            urls: vec!["https://example.com/".into()],
+            mode: FetchMode::Http,
+            crawl: None,
+            language: Some("de-DE".into()),
+            revalidate_source_id: Some(source),
+        };
+        assert!(valid.validate_representation().is_ok());
+        for invalid in ["", "en_US", "-en", "en-", "en\r\nIf-None-Match-x"] {
+            let mut args = valid.clone();
+            args.language = Some(invalid.into());
+            assert_eq!(
+                args.validate_representation(),
+                Err(ErrorCode::InvalidRequest)
+            );
+        }
+        let mut args = valid;
+        args.urls.push("https://example.net/".into());
+        assert_eq!(
+            args.validate_representation(),
+            Err(ErrorCode::InvalidRequest)
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
