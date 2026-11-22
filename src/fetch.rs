@@ -1464,6 +1464,9 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
+    const CONDITIONAL_FIRST_ENTITY: &[u8] = b"first\0binary-page-two";
+    const CONDITIONAL_CHANGED_ENTITY: &[u8] = b"changed\0bytes";
+
     struct Route {
         status: u16,
         body: &'static [u8],
@@ -1519,7 +1522,7 @@ mod tests {
             if path == "/conditional" && prior_calls >= 2 {
                 return Ok(HttpResponse {
                     status: 200,
-                    body: b"changed\0bytes".to_vec(),
+                    body: CONDITIONAL_CHANGED_ENTITY.to_vec(),
                     headers: [
                         (
                             "content-type".parse().unwrap(),
@@ -1696,7 +1699,7 @@ mod tests {
     #[tokio::test]
     async fn conditional_fetch_reuses_304_evidence_then_archives_changed_200() {
         let root = tempfile::tempdir().unwrap();
-        let mut entity = route(200, b"first\0binary", "text/plain");
+        let mut entity = route(200, CONDITIONAL_FIRST_ENTITY, "text/plain");
         entity
             .headers
             .insert("etag", HeaderValue::from_static("\"v1\""));
@@ -1736,8 +1739,14 @@ mod tests {
             .unwrap();
         assert!(matches!(first.retrieval.kind, RetrievalKind::Fresh));
         assert_eq!(first.retrieval.origin_status, 200);
-        assert_eq!(first.retrieval.request_bytes, 12);
-        assert_eq!(first.retrieval.entity_bytes, 12);
+        assert_eq!(
+            first.retrieval.request_bytes,
+            CONDITIONAL_FIRST_ENTITY.len() as u64
+        );
+        assert_eq!(
+            first.retrieval.entity_bytes,
+            CONDITIONAL_FIRST_ENTITY.len() as u64
+        );
         assert!(matches!(
             fetcher
                 .revalidate(
@@ -1756,7 +1765,10 @@ mod tests {
             .unwrap();
         assert!(matches!(cached.retrieval.kind, RetrievalKind::CacheHit));
         assert_eq!(cached.retrieval.request_bytes, 0);
-        assert_eq!(cached.retrieval.entity_bytes, 12);
+        assert_eq!(
+            cached.retrieval.entity_bytes,
+            CONDITIONAL_FIRST_ENTITY.len() as u64
+        );
         assert_eq!(
             transport
                 .calls
@@ -1783,7 +1795,10 @@ mod tests {
         ));
         assert_eq!(validated.retrieval.origin_status, 304);
         assert_eq!(validated.retrieval.request_bytes, 0);
-        assert_eq!(validated.retrieval.entity_bytes, 12);
+        assert_eq!(
+            validated.retrieval.entity_bytes,
+            CONDITIONAL_FIRST_ENTITY.len() as u64
+        );
         assert_eq!(validated.raw_source_id, first.raw_source_id);
         let raw = store.get(context.owner, first.raw_source_id).await.unwrap();
         let chunk = store
@@ -1792,15 +1807,15 @@ mod tests {
                 first.raw_source_id,
                 raw.representations[0].id,
                 None,
-                10,
+                16,
             )
             .await
             .unwrap();
-        assert_eq!(chunk.total, 12);
+        assert_eq!(chunk.total, CONDITIONAL_FIRST_ENTITY.len() as u64);
         assert_eq!(chunk.source_id, first.raw_source_id);
         assert!(chunk.truncated);
         assert_eq!(chunk.start, 0);
-        assert_eq!(chunk.end, 6);
+        assert_eq!(chunk.end, 9);
         let mut replayed =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &chunk.content)
                 .unwrap();
@@ -1821,7 +1836,7 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_eq!(replayed, b"first\0binary");
+        assert_eq!(replayed, CONDITIONAL_FIRST_ENTITY);
         assert!(!remainder.truncated);
         let conditional_headers = transport.observed.lock().unwrap().last().unwrap().clone();
         assert_eq!(conditional_headers.get(IF_NONE_MATCH).unwrap(), "\"v1\"");
@@ -1838,14 +1853,23 @@ mod tests {
             .unwrap();
         assert!(matches!(changed.retrieval.kind, RetrievalKind::Fresh));
         assert_eq!(changed.retrieval.origin_status, 200);
-        assert_eq!(changed.retrieval.request_bytes, 13);
-        assert_eq!(changed.retrieval.entity_bytes, 13);
+        assert_eq!(
+            changed.retrieval.request_bytes,
+            CONDITIONAL_CHANGED_ENTITY.len() as u64
+        );
+        assert_eq!(
+            changed.retrieval.entity_bytes,
+            CONDITIONAL_CHANGED_ENTITY.len() as u64
+        );
         assert_ne!(changed.raw_source_id, first.raw_source_id);
         let source = store
             .get(context.owner, changed.raw_source_id)
             .await
             .unwrap();
-        assert_eq!(source.representations[0].bytes, 13);
+        assert_eq!(
+            source.representations[0].bytes,
+            CONDITIONAL_CHANGED_ENTITY.len() as u64
+        );
         let ordinary_after_change = fetcher
             .fetch_variant(&context, &conditional_target, Some("en-US"))
             .await
@@ -1854,8 +1878,14 @@ mod tests {
             ordinary_after_change.retrieval.kind,
             RetrievalKind::Fresh
         ));
-        assert_eq!(ordinary_after_change.retrieval.request_bytes, 13);
-        assert_eq!(ordinary_after_change.retrieval.entity_bytes, 13);
+        assert_eq!(
+            ordinary_after_change.retrieval.request_bytes,
+            CONDITIONAL_CHANGED_ENTITY.len() as u64
+        );
+        assert_eq!(
+            ordinary_after_change.retrieval.entity_bytes,
+            CONDITIONAL_CHANGED_ENTITY.len() as u64
+        );
         assert_eq!(
             ordinary_after_change.retrieval.final_url,
             conditional_target.as_str()
@@ -1881,7 +1911,7 @@ mod tests {
                 &current_bytes.content,
             )
             .unwrap(),
-            b"changed\0bytes"
+            CONDITIONAL_CHANGED_ENTITY
         );
         assert_eq!(
             transport
